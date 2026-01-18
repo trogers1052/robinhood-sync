@@ -19,3 +19,7 @@ python-dateutil>=2.8.0
 
 # 2FA Support
 pyotp>=2.9.0
+
+# Testing
+pytest>=8.0.0
+pytest-mock>=3.12.0
