@@ -6,8 +6,8 @@ robin-stocks>=3.0.0
 # Kafka
 kafka-python>=2.0.0
 
-# Database
-psycopg2-binary>=2.9.0
+# Redis (for tracking synced orders)
+redis>=5.0.0
 
 # Configuration
 python-dotenv>=1.0.0

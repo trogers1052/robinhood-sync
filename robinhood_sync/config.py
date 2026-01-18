@@ -21,20 +21,26 @@ class Settings(BaseSettings):
     kafka_brokers: str = Field("localhost:19092", description="Kafka broker addresses")
     kafka_topic: str = Field("trading.orders", description="Kafka topic for trade events")
 
-    # Database configuration (for tracking synced orders)
-    db_host: str = Field("localhost", description="PostgreSQL host")
-    db_port: int = Field(5432, description="PostgreSQL port")
-    db_user: str = Field("trader", description="PostgreSQL user")
-    db_password: str = Field("trader5", description="PostgreSQL password")
-    db_name: str = Field("trading_platform", description="PostgreSQL database name")
+    # Redis configuration (for tracking synced orders)
+    redis_host: str = Field("localhost", description="Redis host")
+    redis_port: int = Field(6379, description="Redis port")
+    redis_password: Optional[str] = Field(None, description="Redis password (optional)")
+    redis_db: int = Field(0, description="Redis database number")
+    redis_synced_orders_key: str = Field(
+        "robinhood:synced_orders", description="Redis key for synced order IDs set"
+    )
 
     # Sync configuration
-    poll_interval_seconds: int = Field(
-        300, description="How often to poll Robinhood for new orders (seconds)"
+    poll_interval_minutes: int = Field(
+        10, description="How often to poll Robinhood during market hours (minutes)"
     )
     sync_history_days: int = Field(
         30, description="How many days of history to sync on first run"
     )
+
+    # Market hours (Eastern Time)
+    market_open_hour: int = Field(4, description="Market open hour (ET) - pre-market starts")
+    market_close_hour: int = Field(20, description="Market close hour (ET) - after-hours ends")
 
     class Config:
         env_file = ".env"
@@ -47,9 +53,11 @@ class Settings(BaseSettings):
         return [b.strip() for b in self.kafka_brokers.split(",")]
 
     @property
-    def database_url(self) -> str:
-        """Return PostgreSQL connection URL."""
-        return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+    def redis_url(self) -> str:
+        """Return Redis connection URL."""
+        if self.redis_password:
+            return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
+        return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
 
 def get_settings() -> Settings:
