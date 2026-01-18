@@ -1,0 +1,21 @@
+# Robinhood Sync Service Dependencies
+
+# Robinhood API
+robin-stocks>=3.0.0
+
+# Kafka
+kafka-python>=2.0.0
+
+# Database
+psycopg2-binary>=2.9.0
+
+# Configuration
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Date handling
+python-dateutil>=2.8.0
+
+# 2FA Support
+pyotp>=2.9.0
