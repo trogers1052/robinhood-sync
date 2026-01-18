@@ -52,6 +52,7 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
         Exit code (0 for success, 1 for failure).
     """
     service = TradeSyncService(settings)
+    logger.info("Go Bears!!!!")
 
     try:
         if not service.initialize():
@@ -94,6 +95,8 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
     )
 
     sync_days = since_days or settings.sync_history_days
+
+    logger.info("Go Bears!!!!")
 
     try:
         if not service.initialize():
