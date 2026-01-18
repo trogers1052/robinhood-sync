@@ -205,7 +205,11 @@ class RobinhoodClient:
 
             filled_trades = [t for t in filled_trades if is_recent(t)]
 
-        logger.info(f"Found {len(filled_trades)} filled trades")
+        # Sort by executed_at ascending (oldest first) so BUYs are processed before SELLs
+        # This ensures positions are created before they can be closed
+        filled_trades.sort(key=lambda t: t.executed_at or t.created_at)
+
+        logger.info(f"Found {len(filled_trades)} filled trades (sorted oldest to newest)")
         return filled_trades
 
     def _parse_order(self, order: dict) -> Optional[Trade]:
