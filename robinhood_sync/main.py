@@ -119,6 +119,8 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
         try:
             new_synced, skipped = service.sync_trades(since_days=sync_days)
             logger.info(f"Initial sync complete: {new_synced} new trades, {skipped} skipped")
+            # Also sync current positions
+            service.sync_positions()
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
             # Continue anyway, will retry in the loop
