@@ -183,14 +183,13 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
             try:
                 # Use shorter history for incremental syncs
                 incremental_days = min(sync_days, 7)
+                # Also sync current positions
+                service.sync_positions()
                 new_synced, skipped = service.sync_trades(since_days=incremental_days)
                 logger.info(
                     f"Sync #{sync_count} complete: {new_synced} new trades, {skipped} skipped"
                 )
                 consecutive_failures = 0
-
-                # Also sync current positions
-                service.sync_positions()
 
                 # Log stats periodically (every hour = 6 syncs at 10 min intervals)
                 if sync_count % 6 == 0:
