@@ -60,6 +60,8 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
             return 1
 
         new_synced, skipped = service.sync_trades(since_days=since_days)
+        # Also sync current positions
+        service.sync_positions()
         logger.info(f"Sync complete: {new_synced} new trades, {skipped} already synced")
         return 0
 
@@ -187,6 +189,9 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                 )
                 consecutive_failures = 0
 
+                # Also sync current positions
+                service.sync_positions()
+
                 # Log stats periodically (every hour = 6 syncs at 10 min intervals)
                 if sync_count % 6 == 0:
                     stats = service.get_sync_stats()
@@ -279,6 +284,7 @@ Examples:
     # Log startup info
     logger.info("=" * 60)
     logger.info("Robinhood Sync Service")
+    logger.info("Go Bears!!!!")
     logger.info("=" * 60)
     logger.info(f"Kafka brokers: {settings.kafka_brokers}")
     logger.info(f"Kafka topic: {settings.kafka_topic}")

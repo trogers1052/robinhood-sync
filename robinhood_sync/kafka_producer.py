@@ -10,24 +10,26 @@ from typing import Optional
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
-from .robinhood_client import Trade
+from .robinhood_client import Trade, Position, AccountBalance
 
 logger = logging.getLogger(__name__)
 
 
 class TradeEventProducer:
-    """Produces trade events to Kafka."""
+    """Produces trade and position events to Kafka."""
 
-    def __init__(self, brokers: list[str], topic: str):
+    def __init__(self, brokers: list[str], topic: str, positions_topic: Optional[str] = None):
         """
         Initialize the Kafka producer.
 
         Args:
             brokers: List of Kafka broker addresses.
             topic: Topic to publish trade events to.
+            positions_topic: Topic to publish position snapshots to.
         """
         self.brokers = brokers
         self.topic = topic
+        self.positions_topic = positions_topic or "trading.positions"
         self._producer: Optional[KafkaProducer] = None
 
     def connect(self) -> bool:
@@ -143,3 +145,60 @@ class TradeEventProducer:
 
         logger.info(f"Published {successful} trades, {failed} failed")
         return successful, failed
+
+    def publish_positions(
+        self, positions: list[Position], balance: AccountBalance
+    ) -> bool:
+        """
+        Publish a positions snapshot to Kafka.
+
+        Args:
+            positions: List of current Position objects.
+            balance: AccountBalance object with buying power info.
+
+        Returns:
+            True if published successfully, False otherwise.
+        """
+        if not self._producer:
+            raise RuntimeError("Kafka producer not connected")
+
+        try:
+            # Create the event payload
+            event = {
+                "event_type": "POSITIONS_SNAPSHOT",
+                "source": "robinhood",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "data": {
+                    "positions": [p.to_dict() for p in positions],
+                    "buying_power": str(balance.buying_power),
+                    "cash": str(balance.cash),
+                    "total_equity": str(balance.total_equity),
+                },
+            }
+
+            # Use "positions" as the key
+            key = "positions"
+
+            logger.info(f"Publishing positions snapshot to Kafka topic '{self.positions_topic}':")
+            logger.info(f"  Positions: {len(positions)}")
+            logger.info(f"  Buying power: ${balance.buying_power}")
+
+            # Send the message
+            future = self._producer.send(
+                self.positions_topic,
+                key=key,
+                value=event,
+            )
+
+            # Wait for send to complete (with timeout)
+            record_metadata = future.get(timeout=10)
+
+            logger.info(
+                f"Successfully published positions snapshot to "
+                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
+            )
+            return True
+
+        except KafkaError as e:
+            logger.error(f"Failed to publish positions snapshot: {e}")
+            return False

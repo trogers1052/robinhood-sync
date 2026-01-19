@@ -8,7 +8,7 @@ from typing import Optional
 from .config import Settings
 from .robinhood_client import RobinhoodClient, Trade
 from .kafka_producer import TradeEventProducer
-from .redis_client import SyncedOrdersTracker
+from .redis_client import SyncedOrdersTracker, PositionStore
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ class TradeSyncService:
         self.robinhood: Optional[RobinhoodClient] = None
         self.kafka: Optional[TradeEventProducer] = None
         self.tracker: Optional[SyncedOrdersTracker] = None
+        self.position_store: Optional[PositionStore] = None
 
     def initialize(self) -> bool:
         """
@@ -48,6 +49,7 @@ class TradeSyncService:
         self.kafka = TradeEventProducer(
             brokers=self.settings.kafka_broker_list,
             topic=self.settings.kafka_topic,
+            positions_topic=self.settings.kafka_positions_topic,
         )
 
         if not self.kafka.connect():
@@ -59,6 +61,13 @@ class TradeSyncService:
 
         if not self.tracker.connect():
             logger.error("Failed to connect to Redis")
+            return False
+
+        # Initialize Redis position store
+        self.position_store = PositionStore(self.settings)
+
+        if not self.position_store.connect():
+            logger.error("Failed to connect to Redis for position store")
             return False
 
         logger.info("All connections initialized successfully")
@@ -117,7 +126,48 @@ class TradeSyncService:
                 )
 
         logger.info(f"Sync complete: {synced} new trades synced, {skipped} skipped")
+
         return synced, skipped
+
+    def sync_positions(self) -> bool:
+        """
+        Sync current positions and buying power from Robinhood.
+
+        Fetches positions and account balance, stores in Redis, and publishes to Kafka.
+
+        Returns:
+            True if sync successful, False otherwise.
+        """
+        if not self.robinhood or not self.kafka or not self.position_store:
+            raise RuntimeError("Service not initialized")
+
+        try:
+            logger.info("Starting positions sync...")
+
+            # Fetch current positions from Robinhood
+            positions = self.robinhood.get_current_positions()
+
+            # Fetch account balance
+            balance = self.robinhood.get_account_balance()
+
+            # Store in Redis
+            self.position_store.store_positions(positions)
+            self.position_store.store_buying_power(balance)
+
+            # Publish to Kafka
+            if self.kafka.publish_positions(positions, balance):
+                logger.info(
+                    f"Positions sync complete: {len(positions)} positions, "
+                    f"buying power ${balance.buying_power}"
+                )
+                return True
+            else:
+                logger.error("Failed to publish positions to Kafka")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error syncing positions: {e}")
+            return False
 
     def get_sync_stats(self) -> dict:
         """
@@ -143,6 +193,9 @@ class TradeSyncService:
 
         if self.tracker:
             self.tracker.close()
+
+        if self.position_store:
+            self.position_store.close()
 
         logger.info("All connections closed")
 

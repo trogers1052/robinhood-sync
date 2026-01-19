@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # Kafka configuration
     kafka_brokers: str = Field("localhost:19092", description="Kafka broker addresses")
     kafka_topic: str = Field("trading.orders", description="Kafka topic for trade events")
+    kafka_positions_topic: str = Field(
+        "trading.positions", description="Kafka topic for position snapshots"
+    )
 
     # Redis configuration (for tracking synced orders)
     redis_host: str = Field("localhost", description="Redis host")

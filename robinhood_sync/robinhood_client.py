@@ -46,6 +46,50 @@ class Trade:
         }
 
 
+@dataclass
+class Position:
+    """Represents a current position (holding) from Robinhood."""
+
+    symbol: str
+    quantity: Decimal
+    average_buy_price: Decimal
+    equity: Decimal  # current market value
+    percent_change: Decimal
+    equity_change: Decimal  # unrealized P&L in dollars
+    updated_at: datetime
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for Kafka/Redis serialization."""
+        return {
+            "symbol": self.symbol,
+            "quantity": str(self.quantity),
+            "average_buy_price": str(self.average_buy_price),
+            "equity": str(self.equity),
+            "percent_change": str(self.percent_change),
+            "equity_change": str(self.equity_change),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+@dataclass
+class AccountBalance:
+    """Represents account balance and buying power from Robinhood."""
+
+    buying_power: Decimal
+    cash: Decimal
+    total_equity: Decimal
+    updated_at: datetime
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for Kafka/Redis serialization."""
+        return {
+            "buying_power": str(self.buying_power),
+            "cash": str(self.cash),
+            "total_equity": str(self.total_equity),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
 class RobinhoodClient:
     """Client for interacting with Robinhood API."""
 
@@ -312,3 +356,96 @@ class RobinhoodClient:
             order_id = order.get("id", "unknown") if isinstance(order, dict) else "unknown"
             logger.warning(f"Error parsing order {order_id}: {e}")
             return None
+
+    def get_current_positions(self) -> list[Position]:
+        """
+        Get current stock positions (holdings) from Robinhood.
+
+        Returns:
+            List of Position objects representing current holdings.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        try:
+            logger.info("Fetching current positions from Robinhood...")
+
+            # build_holdings() returns a dict keyed by symbol with position details
+            holdings = rh.account.build_holdings()
+
+            if not holdings:
+                logger.info("No positions found")
+                return []
+
+            positions = []
+            now = datetime.now(timezone.utc)
+
+            for symbol, data in holdings.items():
+                try:
+                    position = Position(
+                        symbol=symbol,
+                        quantity=Decimal(str(data.get("quantity", "0"))),
+                        average_buy_price=Decimal(str(data.get("average_buy_price", "0"))),
+                        equity=Decimal(str(data.get("equity", "0"))),
+                        percent_change=Decimal(str(data.get("percent_change", "0"))),
+                        equity_change=Decimal(str(data.get("equity_change", "0"))),
+                        updated_at=now,
+                    )
+                    positions.append(position)
+                except Exception as e:
+                    logger.warning(f"Failed to parse position for {symbol}: {e}")
+                    continue
+
+            logger.info(f"Found {len(positions)} current positions")
+            return positions
+
+        except Exception as e:
+            logger.error(f"Error fetching positions: {e}")
+            raise
+
+    def get_account_balance(self) -> AccountBalance:
+        """
+        Get account balance and buying power from Robinhood.
+
+        Returns:
+            AccountBalance object with buying power, cash, and total equity.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        try:
+            logger.info("Fetching account balance from Robinhood...")
+
+            # Get account profile for balance info
+            profile = rh.profiles.load_account_profile()
+
+            if not profile:
+                raise RuntimeError("Failed to load account profile")
+
+            # Get portfolio info for total equity
+            portfolio = rh.profiles.load_portfolio_profile()
+
+            buying_power = Decimal(str(profile.get("buying_power", "0")))
+            cash = Decimal(str(profile.get("cash", "0")))
+
+            # Total equity comes from portfolio
+            total_equity = Decimal("0")
+            if portfolio:
+                total_equity = Decimal(str(portfolio.get("equity", "0")))
+
+            balance = AccountBalance(
+                buying_power=buying_power,
+                cash=cash,
+                total_equity=total_equity,
+                updated_at=datetime.now(timezone.utc),
+            )
+
+            logger.info(
+                f"Account balance: buying_power=${buying_power}, "
+                f"cash=${cash}, total_equity=${total_equity}"
+            )
+            return balance
+
+        except Exception as e:
+            logger.error(f"Error fetching account balance: {e}")
+            raise
