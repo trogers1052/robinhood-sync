@@ -10,15 +10,21 @@ from typing import Optional
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
-from .robinhood_client import Trade, Position, AccountBalance
+from .robinhood_client import Trade, Position, AccountBalance, WatchlistStock
 
 logger = logging.getLogger(__name__)
 
 
 class TradeEventProducer:
-    """Produces trade and position events to Kafka."""
+    """Produces trade, position, and watchlist events to Kafka."""
 
-    def __init__(self, brokers: list[str], topic: str, positions_topic: Optional[str] = None):
+    def __init__(
+        self,
+        brokers: list[str],
+        topic: str,
+        positions_topic: Optional[str] = None,
+        watchlist_topic: Optional[str] = None,
+    ):
         """
         Initialize the Kafka producer.
 
@@ -26,10 +32,12 @@ class TradeEventProducer:
             brokers: List of Kafka broker addresses.
             topic: Topic to publish trade events to.
             positions_topic: Topic to publish position snapshots to.
+            watchlist_topic: Topic to publish watchlist events to.
         """
         self.brokers = brokers
         self.topic = topic
         self.positions_topic = positions_topic or "trading.positions"
+        self.watchlist_topic = watchlist_topic or "trading.watchlist"
         self._producer: Optional[KafkaProducer] = None
 
     def connect(self) -> bool:
@@ -201,4 +209,163 @@ class TradeEventProducer:
 
         except KafkaError as e:
             logger.error(f"Failed to publish positions snapshot: {e}")
+            return False
+
+    def publish_watchlist_update(
+        self,
+        added_symbols: list[str],
+        removed_symbols: list[str],
+        all_symbols: list[str],
+        stocks: Optional[list[WatchlistStock]] = None,
+    ) -> bool:
+        """
+        Publish a watchlist update event to Kafka.
+
+        This event notifies other services when the watchlist changes.
+
+        Args:
+            added_symbols: List of newly added symbols.
+            removed_symbols: List of removed symbols.
+            all_symbols: Complete list of all symbols in watchlist.
+            stocks: Optional list of WatchlistStock objects with full details.
+
+        Returns:
+            True if published successfully, False otherwise.
+        """
+        if not self._producer:
+            raise RuntimeError("Kafka producer not connected")
+
+        try:
+            # Create the event payload
+            event = {
+                "event_type": "WATCHLIST_UPDATED",
+                "source": "robinhood",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "data": {
+                    "added_symbols": added_symbols,
+                    "removed_symbols": removed_symbols,
+                    "all_symbols": all_symbols,
+                    "total_count": len(all_symbols),
+                    "stocks": [s.to_dict() for s in stocks] if stocks else [],
+                },
+            }
+
+            key = "watchlist"
+
+            logger.info(f"Publishing watchlist update to Kafka topic '{self.watchlist_topic}':")
+            logger.info(f"  Added: {added_symbols}")
+            logger.info(f"  Removed: {removed_symbols}")
+            logger.info(f"  Total symbols: {len(all_symbols)}")
+
+            # Send the message
+            future = self._producer.send(
+                self.watchlist_topic,
+                key=key,
+                value=event,
+            )
+
+            # Wait for send to complete
+            record_metadata = future.get(timeout=10)
+
+            logger.info(
+                f"Successfully published watchlist update to "
+                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
+            )
+            return True
+
+        except KafkaError as e:
+            logger.error(f"Failed to publish watchlist update: {e}")
+            return False
+
+    def publish_symbol_added(self, symbol: str, name: str = "") -> bool:
+        """
+        Publish an event when a single symbol is added to the watchlist.
+
+        Args:
+            symbol: Stock symbol that was added.
+            name: Optional company name.
+
+        Returns:
+            True if published successfully, False otherwise.
+        """
+        if not self._producer:
+            raise RuntimeError("Kafka producer not connected")
+
+        try:
+            event = {
+                "event_type": "WATCHLIST_SYMBOL_ADDED",
+                "source": "robinhood",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "data": {
+                    "symbol": symbol,
+                    "name": name or symbol,
+                },
+            }
+
+            # Use the symbol as the key
+            key = symbol
+
+            logger.info(f"Publishing symbol added event: {symbol}")
+
+            future = self._producer.send(
+                self.watchlist_topic,
+                key=key,
+                value=event,
+            )
+
+            record_metadata = future.get(timeout=10)
+
+            logger.info(
+                f"Successfully published symbol added event to "
+                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
+            )
+            return True
+
+        except KafkaError as e:
+            logger.error(f"Failed to publish symbol added event: {e}")
+            return False
+
+    def publish_symbol_removed(self, symbol: str) -> bool:
+        """
+        Publish an event when a symbol is removed from the watchlist.
+
+        Args:
+            symbol: Stock symbol that was removed.
+
+        Returns:
+            True if published successfully, False otherwise.
+        """
+        if not self._producer:
+            raise RuntimeError("Kafka producer not connected")
+
+        try:
+            event = {
+                "event_type": "WATCHLIST_SYMBOL_REMOVED",
+                "source": "robinhood",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "data": {
+                    "symbol": symbol,
+                },
+            }
+
+            key = symbol
+
+            logger.info(f"Publishing symbol removed event: {symbol}")
+
+            future = self._producer.send(
+                self.watchlist_topic,
+                key=key,
+                value=event,
+            )
+
+            record_metadata = future.get(timeout=10)
+
+            logger.info(
+                f"Successfully published symbol removed event to "
+                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
+            )
+            return True
+
+        except KafkaError as e:
+            logger.error(f"Failed to publish symbol removed event: {e}")
             return False

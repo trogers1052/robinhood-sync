@@ -90,6 +90,25 @@ class AccountBalance:
         }
 
 
+@dataclass
+class WatchlistStock:
+    """Represents a stock in the Robinhood watchlist."""
+
+    symbol: str
+    name: str
+    instrument_url: str
+    added_at: datetime
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for Kafka/Redis serialization."""
+        return {
+            "symbol": self.symbol,
+            "name": self.name,
+            "instrument_url": self.instrument_url,
+            "added_at": self.added_at.isoformat(),
+        }
+
+
 class RobinhoodClient:
     """Client for interacting with Robinhood API."""
 
@@ -448,4 +467,138 @@ class RobinhoodClient:
 
         except Exception as e:
             logger.error(f"Error fetching account balance: {e}")
+            raise
+
+    def get_watchlist(self, watchlist_name: str = "Default") -> list[WatchlistStock]:
+        """
+        Get stocks from a Robinhood watchlist.
+
+        Args:
+            watchlist_name: Name of the watchlist (default: "Default")
+
+        Returns:
+            List of WatchlistStock objects.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        try:
+            logger.info(f"Fetching watchlist '{watchlist_name}' from Robinhood...")
+
+            # Get all watchlists
+            watchlists = rh.account.get_all_watchlists()
+
+            if not watchlists:
+                logger.info("No watchlists found")
+                return []
+
+            # Find the requested watchlist
+            target_watchlist = None
+            for wl in watchlists:
+                if wl.get("display_name") == watchlist_name:
+                    target_watchlist = wl
+                    break
+
+            if not target_watchlist:
+                logger.warning(f"Watchlist '{watchlist_name}' not found")
+                # List available watchlists for debugging
+                available = [wl.get("display_name") for wl in watchlists]
+                logger.info(f"Available watchlists: {available}")
+                return []
+
+            # Get the watchlist items
+            watchlist_url = target_watchlist.get("url")
+            if not watchlist_url:
+                logger.error("Watchlist has no URL")
+                return []
+
+            # Fetch watchlist items using robin_stocks
+            items = rh.account.get_watchlist_by_name(name=watchlist_name)
+
+            if not items:
+                logger.info(f"Watchlist '{watchlist_name}' is empty")
+                return []
+
+            stocks = []
+            now = datetime.now(timezone.utc)
+
+            for item in items:
+                try:
+                    # Each item has an instrument URL
+                    instrument_url = item.get("instrument")
+                    if not instrument_url:
+                        continue
+
+                    # Get instrument details
+                    instrument = rh.stocks.get_instrument_by_url(instrument_url)
+                    if not instrument:
+                        continue
+
+                    symbol = instrument.get("symbol", "UNKNOWN")
+                    name = instrument.get("simple_name") or instrument.get("name", symbol)
+
+                    # Parse created_at if available
+                    created_at_str = item.get("created_at")
+                    if created_at_str:
+                        added_at = date_parser.parse(created_at_str)
+                    else:
+                        added_at = now
+
+                    stock = WatchlistStock(
+                        symbol=symbol,
+                        name=name,
+                        instrument_url=instrument_url,
+                        added_at=added_at,
+                    )
+                    stocks.append(stock)
+
+                except Exception as e:
+                    logger.warning(f"Failed to parse watchlist item: {e}")
+                    continue
+
+            logger.info(f"Found {len(stocks)} stocks in watchlist '{watchlist_name}'")
+            return stocks
+
+        except Exception as e:
+            logger.error(f"Error fetching watchlist: {e}")
+            raise
+
+    def get_all_watchlist_symbols(self) -> list[str]:
+        """
+        Get all unique symbols from all watchlists.
+
+        Returns:
+            List of unique stock symbols across all watchlists.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        try:
+            logger.info("Fetching all watchlist symbols...")
+
+            # Get all watchlists
+            watchlists = rh.account.get_all_watchlists()
+
+            if not watchlists:
+                logger.info("No watchlists found")
+                return []
+
+            all_symbols = set()
+
+            for wl in watchlists:
+                watchlist_name = wl.get("display_name", "Unknown")
+                try:
+                    stocks = self.get_watchlist(watchlist_name)
+                    for stock in stocks:
+                        all_symbols.add(stock.symbol)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch watchlist '{watchlist_name}': {e}")
+                    continue
+
+            symbols_list = sorted(list(all_symbols))
+            logger.info(f"Found {len(symbols_list)} unique symbols across all watchlists")
+            return symbols_list
+
+        except Exception as e:
+            logger.error(f"Error fetching watchlist symbols: {e}")
             raise

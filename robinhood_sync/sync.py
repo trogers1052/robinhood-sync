@@ -8,7 +8,7 @@ from typing import Optional
 from .config import Settings
 from .robinhood_client import RobinhoodClient, Trade
 from .kafka_producer import TradeEventProducer
-from .redis_client import SyncedOrdersTracker, PositionStore
+from .redis_client import SyncedOrdersTracker, PositionStore, WatchlistStore
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ class TradeSyncService:
         self.kafka: Optional[TradeEventProducer] = None
         self.tracker: Optional[SyncedOrdersTracker] = None
         self.position_store: Optional[PositionStore] = None
+        self.watchlist_store: Optional[WatchlistStore] = None
 
     def initialize(self) -> bool:
         """
@@ -50,6 +51,7 @@ class TradeSyncService:
             brokers=self.settings.kafka_broker_list,
             topic=self.settings.kafka_topic,
             positions_topic=self.settings.kafka_positions_topic,
+            watchlist_topic=self.settings.kafka_watchlist_topic,
         )
 
         if not self.kafka.connect():
@@ -68,6 +70,13 @@ class TradeSyncService:
 
         if not self.position_store.connect():
             logger.error("Failed to connect to Redis for position store")
+            return False
+
+        # Initialize Redis watchlist store
+        self.watchlist_store = WatchlistStore(self.settings)
+
+        if not self.watchlist_store.connect():
+            logger.error("Failed to connect to Redis for watchlist store")
             return False
 
         logger.info("All connections initialized successfully")
@@ -169,6 +178,66 @@ class TradeSyncService:
             logger.error(f"Error syncing positions: {e}")
             return False
 
+    def sync_watchlist(self) -> tuple[int, int]:
+        """
+        Sync watchlist from Robinhood.
+
+        Fetches watchlist, syncs to Redis, and publishes Kafka events for changes.
+
+        Returns:
+            Tuple of (added_count, removed_count).
+        """
+        if not self.robinhood or not self.kafka or not self.watchlist_store:
+            raise RuntimeError("Service not initialized")
+
+        try:
+            logger.info("Starting watchlist sync...")
+
+            # Fetch watchlist from Robinhood
+            stocks = self.robinhood.get_watchlist()
+
+            if not stocks:
+                logger.info("No stocks found in Robinhood watchlist")
+                # Still sync empty list to handle removals
+                stocks = []
+
+            # Sync to Redis and get changes
+            added_symbols, removed_symbols = self.watchlist_store.sync_watchlist(stocks)
+
+            # Publish Kafka events for changes
+            if added_symbols or removed_symbols:
+                # Publish overall watchlist update event
+                all_symbols = sorted([s.symbol for s in stocks])
+                self.kafka.publish_watchlist_update(
+                    added_symbols=added_symbols,
+                    removed_symbols=removed_symbols,
+                    all_symbols=all_symbols,
+                    stocks=stocks,
+                )
+
+                # Publish individual symbol events for granular updates
+                for symbol in added_symbols:
+                    # Find the stock details
+                    stock = next((s for s in stocks if s.symbol == symbol), None)
+                    name = stock.name if stock else symbol
+                    self.kafka.publish_symbol_added(symbol, name)
+                    logger.info(f"Published symbol added event: {symbol}")
+
+                for symbol in removed_symbols:
+                    self.kafka.publish_symbol_removed(symbol)
+                    logger.info(f"Published symbol removed event: {symbol}")
+
+            logger.info(
+                f"Watchlist sync complete: {len(stocks)} total symbols, "
+                f"{len(added_symbols)} added, {len(removed_symbols)} removed"
+            )
+
+            return len(added_symbols), len(removed_symbols)
+
+        except Exception as e:
+            logger.error(f"Error syncing watchlist: {e}")
+            raise
+
     def get_sync_stats(self) -> dict:
         """
         Get statistics about synced trades.
@@ -196,6 +265,9 @@ class TradeSyncService:
 
         if self.position_store:
             self.position_store.close()
+
+        if self.watchlist_store:
+            self.watchlist_store.close()
 
         logger.info("All connections closed")
 

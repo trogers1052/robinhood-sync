@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     kafka_positions_topic: str = Field(
         "trading.positions", description="Kafka topic for position snapshots"
     )
+    kafka_watchlist_topic: str = Field(
+        "trading.watchlist", description="Kafka topic for watchlist events"
+    )
 
     # Redis configuration (for tracking synced orders)
     redis_host: str = Field("localhost", description="Redis host")

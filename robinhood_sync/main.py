@@ -62,7 +62,10 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
         new_synced, skipped = service.sync_trades(since_days=since_days)
         # Also sync current positions
         service.sync_positions()
+        # Sync watchlist
+        added, removed = service.sync_watchlist()
         logger.info(f"Sync complete: {new_synced} new trades, {skipped} already synced")
+        logger.info(f"Watchlist: {added} added, {removed} removed")
         return 0
 
     except Exception as e:
@@ -121,6 +124,10 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
             logger.info(f"Initial sync complete: {new_synced} new trades, {skipped} skipped")
             # Also sync current positions
             service.sync_positions()
+            logger.info("Current positions synced")
+            # Sync watchlist
+            added, removed = service.sync_watchlist()
+            logger.info(f"Initial watchlist sync: {added} added, {removed} removed")
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
             # Continue anyway, will retry in the loop
@@ -187,6 +194,11 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                 incremental_days = min(sync_days, 7)
                 # Also sync current positions
                 service.sync_positions()
+                logger.info("Current positions synced")
+                new_synced, skipped = service.sync_trades(since_days=incremental_days)
+                added, removed = service.sync_watchlist()
+                if added or removed:
+                    logger.info(f"Watchlist changes: {added} added, {removed} removed")
                 new_synced, skipped = service.sync_trades(since_days=incremental_days)
                 logger.info(
                     f"Sync #{sync_count} complete: {new_synced} new trades, {skipped} skipped"
@@ -288,7 +300,7 @@ Examples:
     logger.info("Go Bears!!!!")
     logger.info("=" * 60)
     logger.info(f"Kafka brokers: {settings.kafka_brokers}")
-    logger.info(f"Kafka topic: {settings.kafka_topic}")
+    logger.info(f"Kafka topics: trades={settings.kafka_topic}, positions={settings.kafka_positions_topic}, watchlist={settings.kafka_watchlist_topic}")
     logger.info(f"Redis: {settings.redis_host}:{settings.redis_port}")
     logger.info(f"Mode: {'single sync' if args.once else 'continuous'}")
     if not args.once:
