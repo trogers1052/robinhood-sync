@@ -210,7 +210,7 @@ class TradeSyncService:
                 # Publish overall watchlist update event
                 logger.info(added_symbols)
                 all_symbols = []
-                for stock in stocks['results']:
+                for stock in stocks:
                     all_symbols.append(stock.get('symbol'))
                 all_symbols = sorted(all_symbols)
                 logger.info(all_symbols)
