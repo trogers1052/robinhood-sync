@@ -524,8 +524,17 @@ class RobinhoodClient:
 
             for item in items:
                 try:
-                    # Each item has an instrument URL
-                    instrument_url = item.get("instrument")
+                    # robin_stocks may return either:
+                    # - a list of strings (instrument URLs directly)
+                    # - a list of dicts with an "instrument" key
+                    if isinstance(item, str):
+                        instrument_url = item
+                    elif isinstance(item, dict):
+                        instrument_url = item.get("instrument")
+                    else:
+                        logger.debug(f"Skipping unexpected item type: {type(item)}")
+                        continue
+
                     if not instrument_url:
                         continue
 
@@ -537,12 +546,12 @@ class RobinhoodClient:
                     symbol = instrument.get("symbol", "UNKNOWN")
                     name = instrument.get("simple_name") or instrument.get("name", symbol)
 
-                    # Parse created_at if available
-                    created_at_str = item.get("created_at")
-                    if created_at_str:
-                        added_at = date_parser.parse(created_at_str)
-                    else:
-                        added_at = now
+                    # Parse created_at if available (only when item is a dict)
+                    added_at = now
+                    if isinstance(item, dict):
+                        created_at_str = item.get("created_at")
+                        if created_at_str:
+                            added_at = date_parser.parse(created_at_str)
 
                     stock = WatchlistStock(
                         symbol=symbol,
