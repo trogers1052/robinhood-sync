@@ -246,7 +246,7 @@ class TradeEventProducer:
                     "removed_symbols": removed_symbols,
                     "all_symbols": all_symbols,
                     "total_count": len(all_symbols),
-                    "stocks": [s.to_dict() for s in stocks] if stocks else [],
+                    "stocks": [s for s in stocks] if stocks else [],
                 },
             }
 
