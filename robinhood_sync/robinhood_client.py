@@ -492,28 +492,35 @@ class RobinhoodClient:
                 logger.info("No watchlists found")
                 return []
 
-            # Find the requested watchlist
+            # Find the requested watchlist - handle both dict and string formats
             target_watchlist = None
+            available_names = []
             for wl in watchlists:
-                if wl.get("display_name") == watchlist_name:
-                    target_watchlist = wl
-                    break
+                if isinstance(wl, dict):
+                    wl_name = wl.get("display_name")
+                    available_names.append(wl_name)
+                    if wl_name == watchlist_name:
+                        target_watchlist = wl
+                        break
+                elif isinstance(wl, str):
+                    # If watchlists are returned as strings, they might be names
+                    available_names.append(wl)
+                    if wl == watchlist_name:
+                        target_watchlist = {"display_name": wl}
+                        break
 
             if not target_watchlist:
                 logger.warning(f"Watchlist '{watchlist_name}' not found")
-                # List available watchlists for debugging
-                available = [wl.get("display_name") for wl in watchlists]
-                logger.info(f"Available watchlists: {available}")
-                return []
-
-            # Get the watchlist items
-            watchlist_url = target_watchlist.get("url")
-            if not watchlist_url:
-                logger.error("Watchlist has no URL")
+                logger.info(f"Available watchlists: {available_names}")
                 return []
 
             # Fetch watchlist items using robin_stocks
+            # get_watchlist_by_name returns instrument data
             items = rh.account.get_watchlist_by_name(name=watchlist_name)
+
+            logger.debug(f"get_watchlist_by_name returned type: {type(items)}, length: {len(items) if items else 0}")
+            if items:
+                logger.debug(f"First item type: {type(items[0]) if items else 'N/A'}")
 
             if not items:
                 logger.info(f"Watchlist '{watchlist_name}' is empty")
@@ -527,24 +534,43 @@ class RobinhoodClient:
                     # robin_stocks may return either:
                     # - a list of strings (instrument URLs directly)
                     # - a list of dicts with an "instrument" key
+                    # - a list of symbols as strings
+                    instrument_url = None
+                    symbol = None
+
                     if isinstance(item, str):
-                        instrument_url = item
+                        # Could be an instrument URL or a symbol
+                        if item.startswith("http"):
+                            instrument_url = item
+                        else:
+                            # Assume it's a symbol
+                            symbol = item
                     elif isinstance(item, dict):
                         instrument_url = item.get("instrument")
+                        # Some responses might have symbol directly
+                        if not instrument_url:
+                            symbol = item.get("symbol")
                     else:
                         logger.debug(f"Skipping unexpected item type: {type(item)}")
                         continue
 
-                    if not instrument_url:
+                    # If we have an instrument URL, fetch the details
+                    if instrument_url:
+                        instrument = rh.stocks.get_instrument_by_url(instrument_url)
+                        if instrument and isinstance(instrument, dict):
+                            symbol = instrument.get("symbol", "UNKNOWN")
+                            name = instrument.get("simple_name") or instrument.get("name", symbol)
+                        else:
+                            continue
+                    elif symbol:
+                        # We have a symbol directly, use it
+                        name = symbol
+                        instrument_url = ""
+                    else:
                         continue
 
-                    # Get instrument details
-                    instrument = rh.stocks.get_instrument_by_url(instrument_url)
-                    if not instrument:
+                    if not symbol:
                         continue
-
-                    symbol = instrument.get("symbol", "UNKNOWN")
-                    name = instrument.get("simple_name") or instrument.get("name", symbol)
 
                     # Parse created_at if available (only when item is a dict)
                     added_at = now
@@ -556,13 +582,13 @@ class RobinhoodClient:
                     stock = WatchlistStock(
                         symbol=symbol,
                         name=name,
-                        instrument_url=instrument_url,
+                        instrument_url=instrument_url or "",
                         added_at=added_at,
                     )
                     stocks.append(stock)
 
                 except Exception as e:
-                    logger.warning(f"Failed to parse watchlist item: {e}")
+                    logger.warning(f"Failed to parse watchlist item {item}: {e}")
                     continue
 
             logger.info(f"Found {len(stocks)} stocks in watchlist '{watchlist_name}'")

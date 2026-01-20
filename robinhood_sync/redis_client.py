@@ -378,7 +378,10 @@ class WatchlistStore:
             current_symbols = self._client.smembers(self.WATCHLIST_KEY)
 
             # Get new symbols from Robinhood
-            new_symbols = {stock.symbol for stock in stocks}
+            new_symbols = set()
+            for stock in stocks:
+                symbol = stock.get('symbol')
+                new_symbols.add(symbol)
 
             # Calculate differences
             added_symbols = new_symbols - current_symbols
@@ -404,7 +407,7 @@ class WatchlistStore:
 
             # Update details for all stocks
             if stocks:
-                details = {stock.symbol: json.dumps(stock.to_dict()) for stock in stocks}
+                details = {stock.get('symbol'): json.dumps(stock) for stock in stocks}
                 self._client.hset(self.WATCHLIST_DETAILS_KEY, mapping=details)
 
             if added_symbols:

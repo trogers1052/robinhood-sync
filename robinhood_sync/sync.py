@@ -3,6 +3,7 @@ Main sync logic for Robinhood trade synchronization.
 """
 
 import logging
+import robin_stocks.robinhood as rh
 from typing import Optional
 
 from .config import Settings
@@ -194,7 +195,8 @@ class TradeSyncService:
             logger.info("Starting watchlist sync...")
 
             # Fetch watchlist from Robinhood
-            stocks = self.robinhood.get_watchlist()
+            watchlist_name = "Resources and assets"
+            stocks = rh.account.get_watchlist_by_name(name=watchlist_name)['results']
 
             if not stocks:
                 logger.info("No stocks found in Robinhood watchlist")
@@ -203,11 +205,15 @@ class TradeSyncService:
 
             # Sync to Redis and get changes
             added_symbols, removed_symbols = self.watchlist_store.sync_watchlist(stocks)
-
             # Publish Kafka events for changes
             if added_symbols or removed_symbols:
                 # Publish overall watchlist update event
-                all_symbols = sorted([s.symbol for s in stocks])
+                logger.info(added_symbols)
+                all_symbols = []
+                for stock in stocks['results']:
+                    all_symbols.append(stock.get('symbol'))
+                all_symbols = sorted(all_symbols)
+                logger.info(all_symbols)
                 self.kafka.publish_watchlist_update(
                     added_symbols=added_symbols,
                     removed_symbols=removed_symbols,
@@ -218,10 +224,12 @@ class TradeSyncService:
                 # Publish individual symbol events for granular updates
                 for symbol in added_symbols:
                     # Find the stock details
-                    stock = next((s for s in stocks if s.symbol == symbol), None)
-                    name = stock.name if stock else symbol
-                    self.kafka.publish_symbol_added(symbol, name)
-                    logger.info(f"Published symbol added event: {symbol}")
+                    for s in stocks:
+                        logger.info(s)
+                        if s.get('symbol') == symbol:
+                            name = s.get('name') if s else symbol
+                            self.kafka.publish_symbol_added(symbol, name)
+                            logger.info(f"Published symbol added event: {symbol}")
 
                 for symbol in removed_symbols:
                     self.kafka.publish_symbol_removed(symbol)
