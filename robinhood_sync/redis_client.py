@@ -11,7 +11,7 @@ import redis
 from .config import Settings
 
 if TYPE_CHECKING:
-    from .robinhood_client import Position, AccountBalance, WatchlistStock
+    from .robinhood_client import Position, AccountBalance, WatchlistStock, StopOrder
 
 logger = logging.getLogger(__name__)
 
@@ -576,3 +576,140 @@ class WatchlistStore:
         except redis.RedisError as e:
             logger.error(f"Failed to count symbols: {e}")
             return 0
+
+
+class StopOrderStore:
+    """
+    Stores pending stop loss orders in Redis.
+
+    This allows stop-loss-guardian to know which positions have stop losses set.
+    """
+
+    STOP_ORDERS_KEY = "robinhood:stop_orders"  # Hash of symbol -> stop order JSON
+    STOP_ORDERS_TTL = 3600  # 1 hour TTL
+
+    def __init__(self, settings: Settings):
+        """
+        Initialize the Redis client for stop order storage.
+
+        Args:
+            settings: Application settings containing Redis configuration.
+        """
+        self.settings = settings
+        self._client: Optional[redis.Redis] = None
+
+    def connect(self) -> bool:
+        """
+        Connect to Redis.
+
+        Returns:
+            True if connection successful, False otherwise.
+        """
+        try:
+            logger.info(f"StopOrderStore connecting to Redis at {self.settings.redis_host}:{self.settings.redis_port}")
+
+            self._client = redis.Redis(
+                host=self.settings.redis_host,
+                port=self.settings.redis_port,
+                password=self.settings.redis_password,
+                db=self.settings.redis_db,
+                decode_responses=True,
+            )
+
+            # Test connection
+            self._client.ping()
+            logger.info("StopOrderStore connected to Redis")
+            return True
+
+        except redis.RedisError as e:
+            logger.error(f"StopOrderStore failed to connect to Redis: {e}")
+            return False
+
+    def close(self) -> None:
+        """Close the Redis connection."""
+        if self._client:
+            self._client.close()
+            logger.info("StopOrderStore Redis connection closed")
+
+    def store_stop_orders(self, stop_orders: list["StopOrder"]) -> bool:
+        """
+        Store pending stop orders in Redis.
+
+        Replaces all existing stop orders with the new snapshot.
+
+        Args:
+            stop_orders: List of StopOrder objects to store.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        if not self._client:
+            raise RuntimeError("Redis client not connected")
+
+        try:
+            # Delete existing stop orders
+            self._client.delete(self.STOP_ORDERS_KEY)
+
+            if not stop_orders:
+                logger.info("No stop orders to store in Redis")
+                return True
+
+            # Store each stop order by symbol
+            # If multiple stop orders for same symbol, keep the one with highest stop price
+            orders_by_symbol = {}
+            for order in stop_orders:
+                existing = orders_by_symbol.get(order.symbol)
+                if existing is None or order.stop_price > existing.stop_price:
+                    orders_by_symbol[order.symbol] = order
+
+            order_data = {symbol: json.dumps(order.to_dict()) for symbol, order in orders_by_symbol.items()}
+            self._client.hset(self.STOP_ORDERS_KEY, mapping=order_data)
+
+            # Set TTL for automatic cleanup
+            self._client.expire(self.STOP_ORDERS_KEY, self.STOP_ORDERS_TTL)
+
+            logger.info(f"Stored {len(orders_by_symbol)} stop orders in Redis")
+            return True
+
+        except redis.RedisError as e:
+            logger.error(f"Failed to store stop orders in Redis: {e}")
+            return False
+
+    def get_stop_order(self, symbol: str) -> Optional[dict]:
+        """
+        Get stop order for a specific symbol.
+
+        Args:
+            symbol: Stock symbol.
+
+        Returns:
+            Stop order data as dict, or None if not found.
+        """
+        if not self._client:
+            raise RuntimeError("Redis client not connected")
+
+        try:
+            data = self._client.hget(self.STOP_ORDERS_KEY, symbol)
+            if data:
+                return json.loads(data)
+            return None
+        except redis.RedisError as e:
+            logger.error(f"Failed to get stop order for {symbol}: {e}")
+            return None
+
+    def get_all_stop_orders(self) -> dict:
+        """
+        Get all stored stop orders from Redis.
+
+        Returns:
+            Dictionary mapping symbol to stop order data.
+        """
+        if not self._client:
+            raise RuntimeError("Redis client not connected")
+
+        try:
+            data = self._client.hgetall(self.STOP_ORDERS_KEY)
+            return {symbol: json.loads(order_json) for symbol, order_json in data.items()}
+        except redis.RedisError as e:
+            logger.error(f"Failed to get stop orders from Redis: {e}")
+            return {}

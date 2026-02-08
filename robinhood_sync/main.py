@@ -64,8 +64,11 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
         service.sync_positions()
         # Sync watchlist
         added, removed = service.sync_watchlist()
+        # Sync stop orders
+        stop_count = service.sync_stop_orders()
         logger.info(f"Sync complete: {new_synced} new trades, {skipped} already synced")
         logger.info(f"Watchlist: {added} added, {removed} removed")
+        logger.info(f"Stop orders: {stop_count} synced")
         return 0
 
     except Exception as e:
@@ -128,6 +131,9 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
             # Sync watchlist
             added, removed = service.sync_watchlist()
             logger.info(f"Initial watchlist sync: {added} added, {removed} removed")
+            # Sync stop orders
+            stop_count = service.sync_stop_orders()
+            logger.info(f"Initial stop orders sync: {stop_count} orders")
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
             # Continue anyway, will retry in the loop
@@ -199,9 +205,10 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                 added, removed = service.sync_watchlist()
                 if added or removed:
                     logger.info(f"Watchlist changes: {added} added, {removed} removed")
-                new_synced, skipped = service.sync_trades(since_days=incremental_days)
+                # Sync stop orders
+                stop_count = service.sync_stop_orders()
                 logger.info(
-                    f"Sync #{sync_count} complete: {new_synced} new trades, {skipped} skipped"
+                    f"Sync #{sync_count} complete: {new_synced} new trades, {skipped} skipped, {stop_count} stop orders"
                 )
                 consecutive_failures = 0
 

@@ -109,6 +109,35 @@ class WatchlistStock:
         }
 
 
+@dataclass
+class StopOrder:
+    """Represents a pending stop loss order from Robinhood."""
+
+    order_id: str
+    symbol: str
+    stop_price: Decimal
+    quantity: Decimal
+    side: str  # "sell" for stop loss
+    order_type: str  # "limit" or "market"
+    limit_price: Optional[Decimal]
+    state: str  # "confirmed", "queued", etc.
+    created_at: datetime
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for Redis serialization."""
+        return {
+            "order_id": self.order_id,
+            "symbol": self.symbol,
+            "stop_price": str(self.stop_price),
+            "quantity": str(self.quantity),
+            "side": self.side,
+            "order_type": self.order_type,
+            "limit_price": str(self.limit_price) if self.limit_price else None,
+            "state": self.state,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
 class RobinhoodClient:
     """Client for interacting with Robinhood API."""
 
@@ -596,6 +625,107 @@ class RobinhoodClient:
 
         except Exception as e:
             logger.error(f"Error fetching watchlist: {e}")
+            raise
+
+    def get_stop_orders(self) -> list[StopOrder]:
+        """
+        Get all pending stop loss orders from Robinhood.
+
+        Returns:
+            List of StopOrder objects for pending stop orders.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        try:
+            logger.info("Fetching pending stop orders from Robinhood...")
+
+            # Get all orders and filter for pending stop orders
+            orders = rh.orders.get_all_stock_orders()
+
+            if not orders:
+                logger.info("No orders found")
+                return []
+
+            stop_orders = []
+
+            for order in orders:
+                try:
+                    if not order or not isinstance(order, dict):
+                        continue
+
+                    # Check if it's a stop order (has trigger = "stop")
+                    trigger = order.get("trigger", "").lower()
+                    state = order.get("state", "").lower()
+
+                    # Only include pending stop orders (not filled/cancelled)
+                    if trigger != "stop":
+                        continue
+
+                    if state not in ("confirmed", "queued", "pending"):
+                        continue
+
+                    order_id = order.get("id")
+                    if not order_id:
+                        continue
+
+                    # Get symbol from instrument URL
+                    instrument_url = order.get("instrument", "")
+                    if not instrument_url:
+                        continue
+
+                    symbol = self._get_symbol_from_instrument(instrument_url)
+
+                    # Parse stop price
+                    stop_price_str = order.get("stop_price")
+                    if not stop_price_str:
+                        continue
+
+                    stop_price = Decimal(stop_price_str)
+
+                    # Parse quantity
+                    quantity_str = order.get("quantity", "0")
+                    quantity = Decimal(quantity_str)
+
+                    # Parse other fields
+                    side = order.get("side", "sell").lower()
+                    order_type = order.get("type", "market").lower()
+
+                    limit_price = None
+                    limit_price_str = order.get("price")
+                    if limit_price_str:
+                        limit_price = Decimal(limit_price_str)
+
+                    # Parse created_at
+                    created_at_str = order.get("created_at")
+                    if created_at_str:
+                        created_at = date_parser.parse(created_at_str)
+                    else:
+                        created_at = datetime.now(timezone.utc)
+
+                    stop_order = StopOrder(
+                        order_id=order_id,
+                        symbol=symbol,
+                        stop_price=stop_price,
+                        quantity=quantity,
+                        side=side,
+                        order_type=order_type,
+                        limit_price=limit_price,
+                        state=state,
+                        created_at=created_at,
+                    )
+                    stop_orders.append(stop_order)
+
+                except Exception as e:
+                    order_id = order.get("id", "unknown") if isinstance(order, dict) else "unknown"
+                    logger.warning(f"Error parsing stop order {order_id}: {e}")
+                    continue
+
+            logger.info(f"Found {len(stop_orders)} pending stop orders")
+            return stop_orders
+
+        except Exception as e:
+            logger.error(f"Error fetching stop orders: {e}")
             raise
 
     def get_all_watchlist_symbols(self) -> list[str]:

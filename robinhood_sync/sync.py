@@ -9,7 +9,7 @@ from typing import Optional
 from .config import Settings
 from .robinhood_client import RobinhoodClient, Trade
 from .kafka_producer import TradeEventProducer
-from .redis_client import SyncedOrdersTracker, PositionStore, WatchlistStore
+from .redis_client import SyncedOrdersTracker, PositionStore, WatchlistStore, StopOrderStore
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ class TradeSyncService:
         self.tracker: Optional[SyncedOrdersTracker] = None
         self.position_store: Optional[PositionStore] = None
         self.watchlist_store: Optional[WatchlistStore] = None
+        self.stop_order_store: Optional[StopOrderStore] = None
 
     def initialize(self) -> bool:
         """
@@ -78,6 +79,13 @@ class TradeSyncService:
 
         if not self.watchlist_store.connect():
             logger.error("Failed to connect to Redis for watchlist store")
+            return False
+
+        # Initialize Redis stop order store
+        self.stop_order_store = StopOrderStore(self.settings)
+
+        if not self.stop_order_store.connect():
+            logger.error("Failed to connect to Redis for stop order store")
             return False
 
         logger.info("All connections initialized successfully")
@@ -179,6 +187,41 @@ class TradeSyncService:
             logger.error(f"Error syncing positions: {e}")
             return False
 
+    def sync_stop_orders(self) -> int:
+        """
+        Sync pending stop loss orders from Robinhood to Redis.
+
+        This allows stop-loss-guardian to know which positions have stop losses.
+
+        Returns:
+            Number of stop orders synced.
+        """
+        if not self.robinhood or not self.stop_order_store:
+            raise RuntimeError("Service not initialized")
+
+        try:
+            logger.info("Starting stop orders sync...")
+
+            # Fetch pending stop orders from Robinhood
+            stop_orders = self.robinhood.get_stop_orders()
+
+            # Store in Redis
+            self.stop_order_store.store_stop_orders(stop_orders)
+
+            if stop_orders:
+                for order in stop_orders:
+                    logger.info(
+                        f"Stop order: {order.symbol} @ ${order.stop_price} "
+                        f"(qty: {order.quantity}, state: {order.state})"
+                    )
+
+            logger.info(f"Stop orders sync complete: {len(stop_orders)} orders")
+            return len(stop_orders)
+
+        except Exception as e:
+            logger.error(f"Error syncing stop orders: {e}")
+            return 0
+
     def sync_watchlist(self) -> tuple[int, int]:
         """
         Sync watchlist from Robinhood.
@@ -276,6 +319,9 @@ class TradeSyncService:
 
         if self.watchlist_store:
             self.watchlist_store.close()
+
+        if self.stop_order_store:
+            self.stop_order_store.close()
 
         logger.info("All connections closed")
 
