@@ -168,20 +168,36 @@ class TradeSyncService:
             # Fetch account balance
             balance = self.robinhood.get_account_balance()
 
-            # Store in Redis
-            self.position_store.store_positions(positions)
-            self.position_store.store_buying_power(balance)
-
-            # Publish to Kafka
-            if self.kafka.publish_positions(positions, balance):
-                logger.info(
-                    f"Positions sync complete: {len(positions)} positions, "
-                    f"buying power ${balance.buying_power}"
+            # Publish to Kafka first.  Kafka is the durable event log; Redis
+            # is a cache derived from it.  By writing Kafka first we ensure
+            # that, on partial failure, downstream consumers (decision-engine,
+            # etc.) see a consistent state: either both systems have the new
+            # data or neither does.  If Kafka fails we abort before touching
+            # Redis.  If Redis fails after a successful Kafka publish we log a
+            # warning — Redis will be refreshed on the next sync cycle.
+            if not self.kafka.publish_positions(positions, balance):
+                logger.error(
+                    "Failed to publish positions to Kafka — aborting Redis write "
+                    "to keep both systems consistent"
                 )
-                return True
-            else:
-                logger.error("Failed to publish positions to Kafka")
                 return False
+
+            # Kafka succeeded — now update the Redis cache.
+            try:
+                self.position_store.store_positions(positions)
+                self.position_store.store_buying_power(balance)
+            except Exception as redis_err:
+                logger.warning(
+                    f"Kafka publish succeeded but Redis cache update failed: {redis_err}. "
+                    f"Redis will be refreshed on the next sync cycle."
+                )
+                # Still return True — the authoritative event has been published.
+
+            logger.info(
+                f"Positions sync complete: {len(positions)} positions, "
+                f"buying power ${balance.buying_power}"
+            )
+            return True
 
         except Exception as e:
             logger.error(f"Error syncing positions: {e}")

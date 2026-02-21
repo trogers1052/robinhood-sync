@@ -7,10 +7,13 @@ Runs continuously during market hours (Mon-Fri, 4am-8pm ET).
 
 import argparse
 import logging
+import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -239,10 +242,35 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
         logger.info("Service stopped")
 
 
+def _start_health_server() -> None:
+    """Start a minimal HTTP health server on a daemon thread."""
+    port = int(os.environ.get("HEALTH_PORT", "8080"))
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *args):
+            pass  # suppress HTTP access logs
+
+    server = HTTPServer(("", port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Health server listening on :{port}/health")
+
+
 def main():
     """Main entry point."""
     # Load environment variables from .env file
     load_dotenv()
+
+    _start_health_server()
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(
