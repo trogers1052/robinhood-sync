@@ -106,20 +106,14 @@ class TradeEventProducer:
             logger.info(f"  Key: {key}")
             logger.info(f"  Event: {json.dumps(event, indent=2)}")
 
-            # Send the message
+            # Send the message (non-blocking — errors handled via callback)
             future = self._producer.send(
                 self.topic,
                 key=key,
                 value=event,
             )
+            future.add_errback(lambda e: logger.error(f"Failed to publish trade {trade.order_id} to Kafka: {e}"))
 
-            # Wait for send to complete (with timeout)
-            record_metadata = future.get(timeout=10)
-
-            logger.info(
-                f"Successfully published trade {trade.order_id} to "
-                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
-            )
             return True
 
         except KafkaError as e:
@@ -191,20 +185,14 @@ class TradeEventProducer:
             logger.info(f"  Positions: {len(positions)}")
             logger.info(f"  Buying power: ${balance.buying_power}")
 
-            # Send the message
+            # Send the message (non-blocking — errors handled via callback)
             future = self._producer.send(
                 self.positions_topic,
                 key=key,
                 value=event,
             )
+            future.add_errback(lambda e: logger.error(f"Failed to publish positions snapshot to Kafka: {e}"))
 
-            # Wait for send to complete (with timeout)
-            record_metadata = future.get(timeout=10)
-
-            logger.info(
-                f"Successfully published positions snapshot to "
-                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
-            )
             return True
 
         except KafkaError as e:
@@ -257,20 +245,14 @@ class TradeEventProducer:
             logger.info(f"  Removed: {removed_symbols}")
             logger.info(f"  Total symbols: {len(all_symbols)}")
 
-            # Send the message
+            # Send the message (non-blocking — errors handled via callback)
             future = self._producer.send(
                 self.watchlist_topic,
                 key=key,
                 value=event,
             )
+            future.add_errback(lambda e: logger.error(f"Failed to publish watchlist update to Kafka: {e}"))
 
-            # Wait for send to complete
-            record_metadata = future.get(timeout=10)
-
-            logger.info(
-                f"Successfully published watchlist update to "
-                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
-            )
             return True
 
         except KafkaError as e:
@@ -312,13 +294,8 @@ class TradeEventProducer:
                 key=key,
                 value=event,
             )
+            future.add_errback(lambda e: logger.error(f"Failed to publish symbol added event to Kafka: {e}"))
 
-            record_metadata = future.get(timeout=10)
-
-            logger.info(
-                f"Successfully published symbol added event to "
-                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
-            )
             return True
 
         except KafkaError as e:
@@ -357,13 +334,8 @@ class TradeEventProducer:
                 key=key,
                 value=event,
             )
+            future.add_errback(lambda e: logger.error(f"Failed to publish symbol removed event to Kafka: {e}"))
 
-            record_metadata = future.get(timeout=10)
-
-            logger.info(
-                f"Successfully published symbol removed event to "
-                f"{record_metadata.topic}:{record_metadata.partition}:{record_metadata.offset}"
-            )
             return True
 
         except KafkaError as e:

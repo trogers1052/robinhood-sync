@@ -176,7 +176,7 @@ class RobinhoodClient:
                 username=self.username,
                 password=self.password,
                 mfa_code=mfa_code,
-                store_session=True,  # Store session to avoid re-login
+                store_session=False,
             )
 
             if login_result:

@@ -373,53 +373,45 @@ class WatchlistStore:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        try:
-            # Get current watchlist from Redis
-            current_symbols = self._client.smembers(self.WATCHLIST_KEY)
+        new_symbols = {s.get('symbol') for s in stocks if s.get('symbol')}
 
-            # Get new symbols from Robinhood
-            new_symbols = set()
-            for stock in stocks:
-                symbol = stock.get('symbol')
-                new_symbols.add(symbol)
+        while True:
+            try:
+                pipe = self._client.pipeline(transaction=True)
+                pipe.watch(self.WATCHLIST_KEY)
+                current_symbols = self._client.smembers(self.WATCHLIST_KEY)
 
-            # Calculate differences
-            added_symbols = new_symbols - current_symbols
-            removed_symbols = current_symbols - new_symbols
+                added_symbols = new_symbols - current_symbols
+                removed_symbols = current_symbols - new_symbols
 
-            # Update Redis with new watchlist
-            if added_symbols or removed_symbols:
-                # Use a pipeline for atomic updates
-                pipe = self._client.pipeline()
+                pipe.multi()
 
-                # Add new symbols
                 if added_symbols:
                     pipe.sadd(self.WATCHLIST_KEY, *added_symbols)
 
-                # Remove old symbols
                 if removed_symbols:
                     pipe.srem(self.WATCHLIST_KEY, *removed_symbols)
-                    # Also remove details for removed symbols
                     for symbol in removed_symbols:
                         pipe.hdel(self.WATCHLIST_DETAILS_KEY, symbol)
 
                 pipe.execute()
 
-            # Update details for all stocks
-            if stocks:
-                details = {stock.get('symbol'): json.dumps(stock) for stock in stocks}
-                self._client.hset(self.WATCHLIST_DETAILS_KEY, mapping=details)
+                if stocks:
+                    details = {stock.get('symbol'): json.dumps(stock) for stock in stocks}
+                    self._client.hset(self.WATCHLIST_DETAILS_KEY, mapping=details)
 
-            if added_symbols:
-                logger.info(f"Added {len(added_symbols)} symbols to watchlist: {sorted(added_symbols)}")
-            if removed_symbols:
-                logger.info(f"Removed {len(removed_symbols)} symbols from watchlist: {sorted(removed_symbols)}")
+                if added_symbols:
+                    logger.info(f"Added {len(added_symbols)} symbols to watchlist: {sorted(added_symbols)}")
+                if removed_symbols:
+                    logger.info(f"Removed {len(removed_symbols)} symbols from watchlist: {sorted(removed_symbols)}")
 
-            return sorted(list(added_symbols)), sorted(list(removed_symbols))
+                return sorted(list(added_symbols)), sorted(list(removed_symbols))
 
-        except redis.RedisError as e:
-            logger.error(f"Failed to sync watchlist: {e}")
-            raise
+            except redis.WatchError:
+                continue
+            except redis.RedisError as e:
+                logger.error(f"Failed to sync watchlist: {e}")
+                raise
 
     def get_symbols(self) -> Set[str]:
         """
