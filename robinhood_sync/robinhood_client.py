@@ -187,11 +187,14 @@ class RobinhoodClient:
                 logger.info("Generated TOTP code for 2FA")
 
             # Login with robin_stocks
+            # store_session=True is required — robin_stocks persists the
+            # device-approval token so headless restarts don't re-trigger
+            # Robinhood's interactive device approval flow.
             login_result = rh.login(
                 username=self.username,
                 password=self.password,
                 mfa_code=mfa_code,
-                store_session=False,
+                store_session=True,
             )
 
             if login_result:
