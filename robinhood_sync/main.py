@@ -69,9 +69,12 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
         added, removed = service.sync_watchlist()
         # Sync stop orders
         stop_count = service.sync_stop_orders()
+        # Sync earnings calendar
+        earnings_count = service.sync_earnings_calendar()
         logger.info(f"Sync complete: {new_synced} new trades, {skipped} already synced")
         logger.info(f"Watchlist: {added} added, {removed} removed")
         logger.info(f"Stop orders: {stop_count} synced")
+        logger.info(f"Earnings calendar: {earnings_count} symbols processed")
         return 0
 
     except Exception as e:
@@ -137,6 +140,9 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
             # Sync stop orders
             stop_count = service.sync_stop_orders()
             logger.info(f"Initial stop orders sync: {stop_count} orders")
+            # Sync earnings calendar on startup
+            earnings_count = service.sync_earnings_calendar()
+            logger.info(f"Initial earnings calendar sync: {earnings_count} symbols")
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
             # Continue anyway, will retry in the loop
@@ -215,10 +221,13 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                 )
                 consecutive_failures = 0
 
-                # Log stats periodically (every hour = 6 syncs at 10 min intervals)
+                # Log stats and sync earnings periodically
+                # (every hour = 6 syncs at 10 min intervals)
                 if sync_count % 6 == 0:
                     stats = service.get_sync_stats()
                     logger.info(f"Sync stats: {stats}")
+                    earnings_count = service.sync_earnings_calendar()
+                    logger.info(f"Earnings calendar refresh: {earnings_count} symbols")
 
             except Exception as e:
                 consecutive_failures += 1

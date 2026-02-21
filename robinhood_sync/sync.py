@@ -3,13 +3,15 @@ Main sync logic for Robinhood trade synchronization.
 """
 
 import logging
-import robin_stocks.robinhood as rh
+from datetime import date
 from typing import Optional
+
+import robin_stocks.robinhood as rh
 
 from .config import Settings
 from .robinhood_client import RobinhoodClient, Trade
 from .kafka_producer import TradeEventProducer
-from .redis_client import SyncedOrdersTracker, PositionStore, WatchlistStore, StopOrderStore
+from .redis_client import SyncedOrdersTracker, PositionStore, WatchlistStore, StopOrderStore, EarningsCalendarStore
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ class TradeSyncService:
         self.position_store: Optional[PositionStore] = None
         self.watchlist_store: Optional[WatchlistStore] = None
         self.stop_order_store: Optional[StopOrderStore] = None
+        self.earnings_store: Optional[EarningsCalendarStore] = None
 
     def initialize(self) -> bool:
         """
@@ -86,6 +89,13 @@ class TradeSyncService:
 
         if not self.stop_order_store.connect():
             logger.error("Failed to connect to Redis for stop order store")
+            return False
+
+        # Initialize Redis earnings calendar store
+        self.earnings_store = EarningsCalendarStore(self.settings)
+
+        if not self.earnings_store.connect():
+            logger.error("Failed to connect to Redis for earnings calendar store")
             return False
 
         logger.info("All connections initialized successfully")
@@ -305,6 +315,106 @@ class TradeSyncService:
             logger.error(f"Error syncing watchlist: {e}")
             raise
 
+    def sync_earnings_calendar(self) -> int:
+        """
+        Sync upcoming earnings dates for all watchlist + position symbols.
+
+        For each symbol, calls the Robinhood earnings endpoint and stores the
+        next upcoming quarter (eps.actual is None and report.date >= today) to
+        Redis as ``robinhood:earnings:{SYMBOL}`` with a 24-hour TTL.
+
+        ETFs (e.g. SPY, SLV) return an empty list — their Redis keys are
+        cleared so the checklist knows there are no upcoming earnings.
+
+        Returns:
+            Number of symbols processed.
+        """
+        if not self.earnings_store or not self.watchlist_store or not self.position_store:
+            raise RuntimeError("Service not initialized")
+
+        try:
+            logger.info("Starting earnings calendar sync...")
+
+            # Collect all symbols: watchlist union positions
+            symbols: set[str] = set()
+            symbols.update(self.watchlist_store.get_symbols())
+            positions = self.position_store.get_positions()
+            symbols.update(positions.keys())
+
+            if not symbols:
+                logger.info("No symbols to sync earnings for")
+                return 0
+
+            today = date.today()
+            processed = 0
+
+            for symbol in sorted(symbols):
+                try:
+                    raw = rh.stocks.get_earnings(symbol)
+                    if not raw:
+                        # ETF or no earnings data — clear any stale key
+                        self.earnings_store.clear_earnings(symbol)
+                        logger.debug(f"No earnings data for {symbol} (likely ETF)")
+                        processed += 1
+                        continue
+
+                    # Find the first quarter where eps.actual is None and
+                    # report.date >= today — that is the next upcoming earnings
+                    upcoming = None
+                    for quarter in raw:
+                        report = quarter.get("report") or {}
+                        eps = quarter.get("eps") or {}
+                        report_date_str = report.get("date", "")
+                        actual = eps.get("actual")
+
+                        if actual is not None:
+                            # Already reported — skip
+                            continue
+
+                        if not report_date_str:
+                            continue
+
+                        try:
+                            report_date = date.fromisoformat(report_date_str)
+                        except ValueError:
+                            continue
+
+                        if report_date >= today:
+                            if upcoming is None or report_date < date.fromisoformat(
+                                upcoming["date"]
+                            ):
+                                upcoming = {
+                                    "date": report_date_str,
+                                    "timing": report.get("timing", ""),
+                                    "verified": report.get("verified", False),
+                                    "days_away": (report_date - today).days,
+                                }
+
+                    if upcoming:
+                        self.earnings_store.store_next_earnings(symbol, upcoming)
+                        logger.info(
+                            f"Earnings {symbol}: {upcoming['date']} "
+                            f"({upcoming['days_away']} days, "
+                            f"verified={upcoming['verified']})"
+                        )
+                    else:
+                        # No upcoming earnings found — clear stale key
+                        self.earnings_store.clear_earnings(symbol)
+                        logger.debug(f"No upcoming earnings found for {symbol}")
+
+                    processed += 1
+
+                except Exception as exc:
+                    logger.warning(f"Failed to fetch earnings for {symbol}: {exc}")
+                    processed += 1
+
+            logger.info(f"Earnings calendar sync complete: {processed} symbols processed")
+            return processed
+
+        except Exception as e:
+            logger.error(f"Error syncing earnings calendar: {e}")
+            return 0
+
     def get_sync_stats(self) -> dict:
         """
         Get statistics about synced trades.
@@ -338,6 +448,9 @@ class TradeSyncService:
 
         if self.stop_order_store:
             self.stop_order_store.close()
+
+        if self.earnings_store:
+            self.earnings_store.close()
 
         logger.info("All connections closed")
 

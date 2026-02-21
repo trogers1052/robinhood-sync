@@ -570,6 +570,92 @@ class WatchlistStore:
             return 0
 
 
+class EarningsCalendarStore:
+    """
+    Stores upcoming earnings dates per symbol in Redis.
+
+    Key pattern: robinhood:earnings:{SYMBOL}
+    Value: JSON blob — {"date": "YYYY-MM-DD", "timing": "am|pm",
+                        "verified": bool, "days_away": int}
+    TTL: 24 hours (refreshed on each sync, auto-expires if symbol removed)
+
+    ETFs return an empty list from Robinhood — we simply skip them.
+    Absent key → no known upcoming earnings (safe for checklist to treat as clear).
+    """
+
+    KEY_PREFIX = "robinhood:earnings"
+    TTL = 86_400  # 24 hours
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._client: Optional[redis.Redis] = None
+
+    def connect(self) -> bool:
+        try:
+            self._client = redis.Redis(
+                host=self.settings.redis_host,
+                port=self.settings.redis_port,
+                password=self.settings.redis_password,
+                db=self.settings.redis_db,
+                decode_responses=True,
+            )
+            self._client.ping()
+            logger.info("EarningsCalendarStore connected to Redis")
+            return True
+        except redis.RedisError as e:
+            logger.error(f"EarningsCalendarStore failed to connect to Redis: {e}")
+            return False
+
+    def close(self) -> None:
+        if self._client:
+            self._client.close()
+
+    def store_next_earnings(self, symbol: str, earnings_data: dict) -> bool:
+        """
+        Store the next upcoming earnings date for a symbol.
+
+        Args:
+            symbol: Ticker symbol.
+            earnings_data: Dict with keys: date, timing, verified, days_away.
+
+        Returns:
+            True if successful.
+        """
+        if not self._client:
+            raise RuntimeError("Redis client not connected")
+        try:
+            key = f"{self.KEY_PREFIX}:{symbol}"
+            self._client.set(key, json.dumps(earnings_data), ex=self.TTL)
+            logger.debug(
+                f"Stored earnings for {symbol}: {earnings_data['date']} "
+                f"({earnings_data['days_away']} days away)"
+            )
+            return True
+        except redis.RedisError as e:
+            logger.error(f"Failed to store earnings for {symbol}: {e}")
+            return False
+
+    def clear_earnings(self, symbol: str) -> None:
+        """Remove the earnings key for a symbol (e.g. ETF with no earnings)."""
+        if not self._client:
+            return
+        try:
+            self._client.delete(f"{self.KEY_PREFIX}:{symbol}")
+        except redis.RedisError:
+            pass
+
+    def get_next_earnings(self, symbol: str) -> Optional[dict]:
+        """Return the stored earnings data for a symbol, or None if absent."""
+        if not self._client:
+            raise RuntimeError("Redis client not connected")
+        try:
+            raw = self._client.get(f"{self.KEY_PREFIX}:{symbol}")
+            return json.loads(raw) if raw else None
+        except (redis.RedisError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to get earnings for {symbol}: {e}")
+            return None
+
+
 class StopOrderStore:
     """
     Stores pending stop loss orders in Redis.
