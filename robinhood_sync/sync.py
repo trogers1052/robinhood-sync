@@ -263,14 +263,12 @@ class TradeSyncService:
         try:
             logger.info("Starting watchlist sync...")
 
-            # Fetch watchlist from Robinhood
             watchlist_name = "Resources and assets"
-            stocks = rh.account.get_watchlist_by_name(name=watchlist_name)['results']
+            raw = rh.account.get_watchlist_by_name(name=watchlist_name)
+            stocks = raw.get('results', []) if isinstance(raw, dict) else []
 
             if not stocks:
                 logger.info("No stocks found in Robinhood watchlist")
-                # Still sync empty list to handle removals
-                stocks = []
 
             # Sync to Redis and get changes
             added_symbols, removed_symbols = self.watchlist_store.sync_watchlist(stocks)

@@ -3,6 +3,7 @@ Robinhood API client wrapper using robin_stocks library.
 """
 
 import logging
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dataclasses import dataclass
@@ -151,7 +152,8 @@ class RobinhoodClient:
         self.password = password
         self.totp_secret = totp_secret
         self._logged_in = False
-        self._instrument_cache: dict[str, str] = {}  # URL -> symbol
+        self._instrument_cache: OrderedDict[str, str] = OrderedDict()  # URL -> symbol
+        self._instrument_cache_max = 1000
 
     def login(self) -> bool:
         """
@@ -212,12 +214,15 @@ class RobinhoodClient:
         fetch it from the instrument URL. Results are cached.
         """
         if instrument_url in self._instrument_cache:
+            self._instrument_cache.move_to_end(instrument_url)
             return self._instrument_cache[instrument_url]
 
         try:
             instrument_data = rh.stocks.get_instrument_by_url(instrument_url)
             symbol = instrument_data.get("symbol", "UNKNOWN")
             self._instrument_cache[instrument_url] = symbol
+            if len(self._instrument_cache) > self._instrument_cache_max:
+                self._instrument_cache.popitem(last=False)
             return symbol
         except Exception as e:
             logger.error(f"Failed to get symbol for instrument {instrument_url}: {e}")

@@ -46,6 +46,9 @@ class SyncedOrdersTracker:
                 password=self.settings.redis_password,
                 db=self.settings.redis_db,
                 decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
             )
 
             # Test connection
@@ -183,6 +186,9 @@ class PositionStore:
                 password=self.settings.redis_password,
                 db=self.settings.redis_db,
                 decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
             )
 
             # Test connection
@@ -216,19 +222,17 @@ class PositionStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            # Delete existing positions
-            self._client.delete(self.POSITIONS_KEY)
-
             if not positions:
+                self._client.delete(self.POSITIONS_KEY)
                 logger.info("No positions to store in Redis")
                 return True
 
-            # Store each position as a hash field
             position_data = {p.symbol: json.dumps(p.to_dict()) for p in positions}
-            self._client.hset(self.POSITIONS_KEY, mapping=position_data)
-
-            # Set TTL for automatic cleanup
-            self._client.expire(self.POSITIONS_KEY, self.POSITIONS_TTL)
+            pipe = self._client.pipeline(transaction=True)
+            pipe.delete(self.POSITIONS_KEY)
+            pipe.hset(self.POSITIONS_KEY, mapping=position_data)
+            pipe.expire(self.POSITIONS_KEY, self.POSITIONS_TTL)
+            pipe.execute()
 
             logger.info(f"Stored {len(positions)} positions in Redis")
             return True
@@ -338,6 +342,9 @@ class WatchlistStore:
                 password=self.settings.redis_password,
                 db=self.settings.redis_db,
                 decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
             )
 
             # Test connection
@@ -598,6 +605,9 @@ class EarningsCalendarStore:
                 password=self.settings.redis_password,
                 db=self.settings.redis_db,
                 decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
             )
             self._client.ping()
             logger.info("EarningsCalendarStore connected to Redis")
@@ -692,6 +702,9 @@ class StopOrderStore:
                 password=self.settings.redis_password,
                 db=self.settings.redis_db,
                 decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
             )
 
             # Test connection
@@ -725,14 +738,11 @@ class StopOrderStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            # Delete existing stop orders
-            self._client.delete(self.STOP_ORDERS_KEY)
-
             if not stop_orders:
+                self._client.delete(self.STOP_ORDERS_KEY)
                 logger.info("No stop orders to store in Redis")
                 return True
 
-            # Store each stop order by symbol
             # If multiple stop orders for same symbol, keep the one with highest stop price
             orders_by_symbol = {}
             for order in stop_orders:
@@ -741,10 +751,11 @@ class StopOrderStore:
                     orders_by_symbol[order.symbol] = order
 
             order_data = {symbol: json.dumps(order.to_dict()) for symbol, order in orders_by_symbol.items()}
-            self._client.hset(self.STOP_ORDERS_KEY, mapping=order_data)
-
-            # Set TTL for automatic cleanup
-            self._client.expire(self.STOP_ORDERS_KEY, self.STOP_ORDERS_TTL)
+            pipe = self._client.pipeline(transaction=True)
+            pipe.delete(self.STOP_ORDERS_KEY)
+            pipe.hset(self.STOP_ORDERS_KEY, mapping=order_data)
+            pipe.expire(self.STOP_ORDERS_KEY, self.STOP_ORDERS_TTL)
+            pipe.execute()
 
             logger.info(f"Stored {len(orders_by_symbol)} stop orders in Redis")
             return True
