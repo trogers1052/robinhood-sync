@@ -78,6 +78,46 @@ class TradeEventProducer:
             except Exception as e:
                 logger.error(f"Error closing Kafka producer: {e}")
 
+    def _reconnect_producer(self) -> bool:
+        """
+        Attempt to recreate the Kafka producer connection.
+
+        Returns:
+            True if reconnection successful, False otherwise.
+        """
+        logger.warning("Attempting Kafka producer reconnection...")
+        if self._producer:
+            try:
+                self._producer.close(timeout=5)
+            except Exception:
+                pass
+            self._producer = None
+        return self.connect()
+
+    def _send_with_retry(self, topic: str, key: str, value: dict) -> None:
+        """
+        Send a message to Kafka with one reconnection retry on failure.
+
+        Args:
+            topic: Kafka topic to send to.
+            key: Message key for partitioning.
+            value: Message value (dict).
+
+        Raises:
+            KafkaError: If send fails after retry.
+            Exception: If send fails after retry with non-Kafka error.
+        """
+        try:
+            future = self._producer.send(topic, key=key, value=value)
+            future.get(timeout=30)
+        except Exception as e:
+            logger.warning(f"Kafka send failed ({type(e).__name__}): {e}, attempting reconnect and retry")
+            if self._reconnect_producer():
+                future = self._producer.send(topic, key=key, value=value)
+                future.get(timeout=30)
+            else:
+                raise
+
     def publish_trade(self, trade: Trade) -> bool:
         """
         Publish a single trade event to Kafka.
@@ -108,12 +148,7 @@ class TradeEventProducer:
             logger.info(f"  Key: {key}")
             logger.info(f"  Event: {json.dumps(event, indent=2)}")
 
-            future = self._producer.send(
-                self.topic,
-                key=key,
-                value=event,
-            )
-            future.get(timeout=30)
+            self._send_with_retry(self.topic, key, event)
 
             return True
 
@@ -188,12 +223,7 @@ class TradeEventProducer:
             logger.info(f"  Positions: {len(positions)}")
             logger.info(f"  Buying power: ${balance.buying_power}")
 
-            future = self._producer.send(
-                self.positions_topic,
-                key=key,
-                value=event,
-            )
-            future.get(timeout=30)
+            self._send_with_retry(self.positions_topic, key, event)
 
             return True
 
@@ -250,12 +280,7 @@ class TradeEventProducer:
             logger.info(f"  Removed: {removed_symbols}")
             logger.info(f"  Total symbols: {len(all_symbols)}")
 
-            future = self._producer.send(
-                self.watchlist_topic,
-                key=key,
-                value=event,
-            )
-            future.get(timeout=30)
+            self._send_with_retry(self.watchlist_topic, key, event)
 
             return True
 
@@ -296,12 +321,7 @@ class TradeEventProducer:
 
             logger.info(f"Publishing symbol added event: {symbol}")
 
-            future = self._producer.send(
-                self.watchlist_topic,
-                key=key,
-                value=event,
-            )
-            future.get(timeout=30)
+            self._send_with_retry(self.watchlist_topic, key, event)
 
             return True
 
@@ -339,12 +359,7 @@ class TradeEventProducer:
 
             logger.info(f"Publishing symbol removed event: {symbol}")
 
-            future = self._producer.send(
-                self.watchlist_topic,
-                key=key,
-                value=event,
-            )
-            future.get(timeout=30)
+            self._send_with_retry(self.watchlist_topic, key, event)
 
             return True
 

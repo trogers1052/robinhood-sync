@@ -16,7 +16,80 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class SyncedOrdersTracker:
+class _RedisBase:
+    """Base class providing Redis connection and reconnection logic."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._client: Optional[redis.Redis] = None
+
+    def _create_client(self) -> redis.Redis:
+        """Create a new Redis client instance."""
+        return redis.Redis(
+            host=self.settings.redis_host,
+            port=self.settings.redis_port,
+            password=self.settings.redis_password,
+            db=self.settings.redis_db,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
+        )
+
+    def _reconnect(self) -> bool:
+        """
+        Attempt to reconnect to Redis by creating a new client.
+
+        Returns:
+            True if reconnection successful, False otherwise.
+        """
+        logger.warning(f"{self.__class__.__name__} attempting Redis reconnection...")
+        try:
+            if self._client:
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+            self._client = self._create_client()
+            self._client.ping()
+            logger.info(f"{self.__class__.__name__} reconnected to Redis")
+            return True
+        except redis.RedisError as e:
+            logger.error(f"{self.__class__.__name__} reconnection failed: {e}")
+            self._client = None
+            return False
+
+    def _with_retry(self, func, *args, **kwargs):
+        """
+        Execute a Redis operation with one reconnection retry on connection failure.
+
+        Args:
+            func: Callable that performs the Redis operation.
+            *args: Positional arguments passed to func.
+            **kwargs: Keyword arguments passed to func.
+
+        Returns:
+            The return value of func.
+
+        Raises:
+            The original exception if retry also fails.
+        """
+        try:
+            return func(*args, **kwargs)
+        except (redis.ConnectionError, redis.TimeoutError, ConnectionError, TimeoutError) as e:
+            logger.warning(f"{self.__class__.__name__} Redis operation failed: {e}, retrying after reconnect")
+            if self._reconnect():
+                return func(*args, **kwargs)
+            raise
+
+    def close(self) -> None:
+        """Close the Redis connection."""
+        if self._client:
+            self._client.close()
+            logger.info(f"{self.__class__.__name__} Redis connection closed")
+
+
+class SyncedOrdersTracker(_RedisBase):
     """Tracks which order IDs have been synced using Redis."""
 
     def __init__(self, settings: Settings):
@@ -26,9 +99,8 @@ class SyncedOrdersTracker:
         Args:
             settings: Application settings containing Redis configuration.
         """
-        self.settings = settings
+        super().__init__(settings)
         self.key = settings.redis_synced_orders_key
-        self._client: Optional[redis.Redis] = None
 
     def connect(self) -> bool:
         """
@@ -40,16 +112,7 @@ class SyncedOrdersTracker:
         try:
             logger.info(f"Connecting to Redis at {self.settings.redis_host}:{self.settings.redis_port}")
 
-            self._client = redis.Redis(
-                host=self.settings.redis_host,
-                port=self.settings.redis_port,
-                password=self.settings.redis_password,
-                db=self.settings.redis_db,
-                decode_responses=True,
-                socket_timeout=5,
-                socket_connect_timeout=5,
-                retry_on_timeout=True,
-            )
+            self._client = self._create_client()
 
             # Test connection
             self._client.ping()
@@ -61,12 +124,6 @@ class SyncedOrdersTracker:
         except redis.RedisError as e:
             logger.error(f"Failed to connect to Redis: {e}")
             return False
-
-    def close(self) -> None:
-        """Close the Redis connection."""
-        if self._client:
-            self._client.close()
-            logger.info("Redis connection closed")
 
     def is_synced(self, order_id: str) -> bool:
         """
@@ -81,7 +138,7 @@ class SyncedOrdersTracker:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        return self._client.sismember(self.key, order_id)
+        return self._with_retry(self._client.sismember, self.key, order_id)
 
     def mark_synced(self, order_id: str) -> None:
         """
@@ -93,7 +150,7 @@ class SyncedOrdersTracker:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        self._client.sadd(self.key, order_id)
+        self._with_retry(self._client.sadd, self.key, order_id)
 
     def mark_many_synced(self, order_ids: list[str]) -> None:
         """
@@ -106,7 +163,7 @@ class SyncedOrdersTracker:
             raise RuntimeError("Redis client not connected")
 
         if order_ids:
-            self._client.sadd(self.key, *order_ids)
+            self._with_retry(self._client.sadd, self.key, *order_ids)
 
     def get_all_synced(self) -> Set[str]:
         """
@@ -118,7 +175,7 @@ class SyncedOrdersTracker:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        return self._client.smembers(self.key)
+        return self._with_retry(self._client.smembers, self.key)
 
     def count_synced(self) -> int:
         """
@@ -130,7 +187,7 @@ class SyncedOrdersTracker:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        return self._client.scard(self.key)
+        return self._with_retry(self._client.scard, self.key)
 
     def remove_synced(self, order_id: str) -> None:
         """
@@ -142,18 +199,18 @@ class SyncedOrdersTracker:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        self._client.srem(self.key, order_id)
+        self._with_retry(self._client.srem, self.key, order_id)
 
     def clear_all(self) -> None:
         """Clear all synced order IDs (use with caution)."""
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        self._client.delete(self.key)
+        self._with_retry(self._client.delete, self.key)
         logger.warning("Cleared all synced order IDs from Redis")
 
 
-class PositionStore:
+class PositionStore(_RedisBase):
     """Stores current positions and account balance in Redis."""
 
     POSITIONS_KEY = "robinhood:positions"
@@ -167,8 +224,7 @@ class PositionStore:
         Args:
             settings: Application settings containing Redis configuration.
         """
-        self.settings = settings
-        self._client: Optional[redis.Redis] = None
+        super().__init__(settings)
 
     def connect(self) -> bool:
         """
@@ -180,16 +236,7 @@ class PositionStore:
         try:
             logger.info(f"PositionStore connecting to Redis at {self.settings.redis_host}:{self.settings.redis_port}")
 
-            self._client = redis.Redis(
-                host=self.settings.redis_host,
-                port=self.settings.redis_port,
-                password=self.settings.redis_password,
-                db=self.settings.redis_db,
-                decode_responses=True,
-                socket_timeout=5,
-                socket_connect_timeout=5,
-                retry_on_timeout=True,
-            )
+            self._client = self._create_client()
 
             # Test connection
             self._client.ping()
@@ -199,12 +246,6 @@ class PositionStore:
         except redis.RedisError as e:
             logger.error(f"PositionStore failed to connect to Redis: {e}")
             return False
-
-    def close(self) -> None:
-        """Close the Redis connection."""
-        if self._client:
-            self._client.close()
-            logger.info("PositionStore Redis connection closed")
 
     def store_positions(self, positions: list["Position"]) -> bool:
         """
@@ -221,7 +262,7 @@ class PositionStore:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        try:
+        def _do_store():
             if not positions:
                 self._client.delete(self.POSITIONS_KEY)
                 logger.info("No positions to store in Redis")
@@ -237,6 +278,8 @@ class PositionStore:
             logger.info(f"Stored {len(positions)} positions in Redis")
             return True
 
+        try:
+            return self._with_retry(_do_store)
         except redis.RedisError as e:
             logger.error(f"Failed to store positions in Redis: {e}")
             return False
@@ -254,7 +297,7 @@ class PositionStore:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        try:
+        def _do_store():
             self._client.set(
                 self.BUYING_POWER_KEY,
                 json.dumps(balance.to_dict()),
@@ -263,6 +306,8 @@ class PositionStore:
             logger.info(f"Stored buying power in Redis: ${balance.buying_power}")
             return True
 
+        try:
+            return self._with_retry(_do_store)
         except redis.RedisError as e:
             logger.error(f"Failed to store buying power in Redis: {e}")
             return False
@@ -278,7 +323,7 @@ class PositionStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            data = self._client.hgetall(self.POSITIONS_KEY)
+            data = self._with_retry(self._client.hgetall, self.POSITIONS_KEY)
             return {symbol: json.loads(pos_json) for symbol, pos_json in data.items()}
         except redis.RedisError as e:
             logger.error(f"Failed to get positions from Redis: {e}")
@@ -295,7 +340,7 @@ class PositionStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            data = self._client.get(self.BUYING_POWER_KEY)
+            data = self._with_retry(self._client.get, self.BUYING_POWER_KEY)
             if data:
                 return json.loads(data)
             return None
@@ -304,7 +349,7 @@ class PositionStore:
             return None
 
 
-class WatchlistStore:
+class WatchlistStore(_RedisBase):
     """
     Stores and manages watchlist symbols in Redis.
 
@@ -323,8 +368,7 @@ class WatchlistStore:
         Args:
             settings: Application settings containing Redis configuration.
         """
-        self.settings = settings
-        self._client: Optional[redis.Redis] = None
+        super().__init__(settings)
 
     def connect(self) -> bool:
         """
@@ -336,16 +380,7 @@ class WatchlistStore:
         try:
             logger.info(f"WatchlistStore connecting to Redis at {self.settings.redis_host}:{self.settings.redis_port}")
 
-            self._client = redis.Redis(
-                host=self.settings.redis_host,
-                port=self.settings.redis_port,
-                password=self.settings.redis_password,
-                db=self.settings.redis_db,
-                decode_responses=True,
-                socket_timeout=5,
-                socket_connect_timeout=5,
-                retry_on_timeout=True,
-            )
+            self._client = self._create_client()
 
             # Test connection
             self._client.ping()
@@ -357,12 +392,6 @@ class WatchlistStore:
         except redis.RedisError as e:
             logger.error(f"WatchlistStore failed to connect to Redis: {e}")
             return False
-
-    def close(self) -> None:
-        """Close the Redis connection."""
-        if self._client:
-            self._client.close()
-            logger.info("WatchlistStore Redis connection closed")
 
     def sync_watchlist(self, stocks: list["WatchlistStock"]) -> tuple[list[str], list[str]]:
         """
@@ -381,6 +410,7 @@ class WatchlistStore:
             raise RuntimeError("Redis client not connected")
 
         new_symbols = {s.get('symbol') for s in stocks if s.get('symbol')}
+        reconnect_attempted = False
 
         while True:
             try:
@@ -416,6 +446,14 @@ class WatchlistStore:
 
             except redis.WatchError:
                 continue
+            except (redis.ConnectionError, redis.TimeoutError, ConnectionError, TimeoutError) as e:
+                if not reconnect_attempted:
+                    logger.warning(f"sync_watchlist connection error: {e}, attempting reconnect")
+                    reconnect_attempted = True
+                    if self._reconnect():
+                        continue
+                logger.error(f"Failed to sync watchlist: {e}")
+                raise
             except redis.RedisError as e:
                 logger.error(f"Failed to sync watchlist: {e}")
                 raise
@@ -431,7 +469,7 @@ class WatchlistStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            return self._client.smembers(self.WATCHLIST_KEY)
+            return self._with_retry(self._client.smembers, self.WATCHLIST_KEY)
         except redis.RedisError as e:
             logger.error(f"Failed to get watchlist symbols: {e}")
             return set()
@@ -450,7 +488,7 @@ class WatchlistStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            data = self._client.hget(self.WATCHLIST_DETAILS_KEY, symbol)
+            data = self._with_retry(self._client.hget, self.WATCHLIST_DETAILS_KEY, symbol)
             if data:
                 return json.loads(data)
             return None
@@ -469,7 +507,7 @@ class WatchlistStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            data = self._client.hgetall(self.WATCHLIST_DETAILS_KEY)
+            data = self._with_retry(self._client.hgetall, self.WATCHLIST_DETAILS_KEY)
             return {symbol: json.loads(details_json) for symbol, details_json in data.items()}
         except redis.RedisError as e:
             logger.error(f"Failed to get all symbol details: {e}")
@@ -489,7 +527,7 @@ class WatchlistStore:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        try:
+        def _do_add():
             # Check if already exists
             already_exists = self._client.sismember(self.WATCHLIST_KEY, symbol)
 
@@ -511,6 +549,8 @@ class WatchlistStore:
 
             return not already_exists
 
+        try:
+            return self._with_retry(_do_add)
         except redis.RedisError as e:
             logger.error(f"Failed to add symbol: {e}")
             return False
@@ -528,7 +568,7 @@ class WatchlistStore:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        try:
+        def _do_remove():
             removed = self._client.srem(self.WATCHLIST_KEY, symbol)
             self._client.hdel(self.WATCHLIST_DETAILS_KEY, symbol)
 
@@ -537,6 +577,8 @@ class WatchlistStore:
 
             return bool(removed)
 
+        try:
+            return self._with_retry(_do_remove)
         except redis.RedisError as e:
             logger.error(f"Failed to remove symbol: {e}")
             return False
@@ -555,7 +597,7 @@ class WatchlistStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            return self._client.sismember(self.WATCHLIST_KEY, symbol)
+            return self._with_retry(self._client.sismember, self.WATCHLIST_KEY, symbol)
         except redis.RedisError as e:
             logger.error(f"Failed to check symbol: {e}")
             return False
@@ -571,13 +613,13 @@ class WatchlistStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            return self._client.scard(self.WATCHLIST_KEY)
+            return self._with_retry(self._client.scard, self.WATCHLIST_KEY)
         except redis.RedisError as e:
             logger.error(f"Failed to count symbols: {e}")
             return 0
 
 
-class EarningsCalendarStore:
+class EarningsCalendarStore(_RedisBase):
     """
     Stores upcoming earnings dates per symbol in Redis.
 
@@ -594,31 +636,17 @@ class EarningsCalendarStore:
     TTL = 86_400  # 24 hours
 
     def __init__(self, settings: Settings):
-        self.settings = settings
-        self._client: Optional[redis.Redis] = None
+        super().__init__(settings)
 
     def connect(self) -> bool:
         try:
-            self._client = redis.Redis(
-                host=self.settings.redis_host,
-                port=self.settings.redis_port,
-                password=self.settings.redis_password,
-                db=self.settings.redis_db,
-                decode_responses=True,
-                socket_timeout=5,
-                socket_connect_timeout=5,
-                retry_on_timeout=True,
-            )
+            self._client = self._create_client()
             self._client.ping()
             logger.info("EarningsCalendarStore connected to Redis")
             return True
         except redis.RedisError as e:
             logger.error(f"EarningsCalendarStore failed to connect to Redis: {e}")
             return False
-
-    def close(self) -> None:
-        if self._client:
-            self._client.close()
 
     def store_next_earnings(self, symbol: str, earnings_data: dict) -> bool:
         """
@@ -633,7 +661,8 @@ class EarningsCalendarStore:
         """
         if not self._client:
             raise RuntimeError("Redis client not connected")
-        try:
+
+        def _do_store():
             key = f"{self.KEY_PREFIX}:{symbol}"
             self._client.set(key, json.dumps(earnings_data), ex=self.TTL)
             logger.debug(
@@ -641,6 +670,9 @@ class EarningsCalendarStore:
                 f"({earnings_data['days_away']} days away)"
             )
             return True
+
+        try:
+            return self._with_retry(_do_store)
         except redis.RedisError as e:
             logger.error(f"Failed to store earnings for {symbol}: {e}")
             return False
@@ -650,7 +682,7 @@ class EarningsCalendarStore:
         if not self._client:
             return
         try:
-            self._client.delete(f"{self.KEY_PREFIX}:{symbol}")
+            self._with_retry(self._client.delete, f"{self.KEY_PREFIX}:{symbol}")
         except redis.RedisError:
             pass
 
@@ -659,14 +691,14 @@ class EarningsCalendarStore:
         if not self._client:
             raise RuntimeError("Redis client not connected")
         try:
-            raw = self._client.get(f"{self.KEY_PREFIX}:{symbol}")
+            raw = self._with_retry(self._client.get, f"{self.KEY_PREFIX}:{symbol}")
             return json.loads(raw) if raw else None
         except (redis.RedisError, json.JSONDecodeError) as e:
             logger.error(f"Failed to get earnings for {symbol}: {e}")
             return None
 
 
-class StopOrderStore:
+class StopOrderStore(_RedisBase):
     """
     Stores pending stop loss orders in Redis.
 
@@ -683,8 +715,7 @@ class StopOrderStore:
         Args:
             settings: Application settings containing Redis configuration.
         """
-        self.settings = settings
-        self._client: Optional[redis.Redis] = None
+        super().__init__(settings)
 
     def connect(self) -> bool:
         """
@@ -696,16 +727,7 @@ class StopOrderStore:
         try:
             logger.info(f"StopOrderStore connecting to Redis at {self.settings.redis_host}:{self.settings.redis_port}")
 
-            self._client = redis.Redis(
-                host=self.settings.redis_host,
-                port=self.settings.redis_port,
-                password=self.settings.redis_password,
-                db=self.settings.redis_db,
-                decode_responses=True,
-                socket_timeout=5,
-                socket_connect_timeout=5,
-                retry_on_timeout=True,
-            )
+            self._client = self._create_client()
 
             # Test connection
             self._client.ping()
@@ -715,12 +737,6 @@ class StopOrderStore:
         except redis.RedisError as e:
             logger.error(f"StopOrderStore failed to connect to Redis: {e}")
             return False
-
-    def close(self) -> None:
-        """Close the Redis connection."""
-        if self._client:
-            self._client.close()
-            logger.info("StopOrderStore Redis connection closed")
 
     def store_stop_orders(self, stop_orders: list["StopOrder"]) -> bool:
         """
@@ -737,7 +753,7 @@ class StopOrderStore:
         if not self._client:
             raise RuntimeError("Redis client not connected")
 
-        try:
+        def _do_store():
             if not stop_orders:
                 self._client.delete(self.STOP_ORDERS_KEY)
                 logger.info("No stop orders to store in Redis")
@@ -760,6 +776,8 @@ class StopOrderStore:
             logger.info(f"Stored {len(orders_by_symbol)} stop orders in Redis")
             return True
 
+        try:
+            return self._with_retry(_do_store)
         except redis.RedisError as e:
             logger.error(f"Failed to store stop orders in Redis: {e}")
             return False
@@ -778,7 +796,7 @@ class StopOrderStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            data = self._client.hget(self.STOP_ORDERS_KEY, symbol)
+            data = self._with_retry(self._client.hget, self.STOP_ORDERS_KEY, symbol)
             if data:
                 return json.loads(data)
             return None
@@ -797,7 +815,7 @@ class StopOrderStore:
             raise RuntimeError("Redis client not connected")
 
         try:
-            data = self._client.hgetall(self.STOP_ORDERS_KEY)
+            data = self._with_retry(self._client.hgetall, self.STOP_ORDERS_KEY)
             return {symbol: json.loads(order_json) for symbol, order_json in data.items()}
         except redis.RedisError as e:
             logger.error(f"Failed to get stop orders from Redis: {e}")

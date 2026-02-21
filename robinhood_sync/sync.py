@@ -264,6 +264,7 @@ class TradeSyncService:
             logger.info("Starting watchlist sync...")
 
             watchlist_name = "Resources and assets"
+            self.robinhood._rate_limit()
             raw = rh.account.get_watchlist_by_name(name=watchlist_name)
             stocks = raw.get('results', []) if isinstance(raw, dict) else []
 
@@ -348,6 +349,7 @@ class TradeSyncService:
 
             for symbol in sorted(symbols):
                 try:
+                    self.robinhood._rate_limit()
                     raw = rh.stocks.get_earnings(symbol)
                     if not raw:
                         # ETF or no earnings data — clear any stale key
