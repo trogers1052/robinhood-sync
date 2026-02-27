@@ -37,8 +37,7 @@ class Settings(BaseSettings):
     )
 
     # Watchlist
-    watchlist_name: str = Field("Materials", description="Robinhood watchlist name to sync (single, backward compat)")
-    watchlist_names: str = Field("", description="Comma-separated Robinhood watchlist names to sync (overrides watchlist_name)")
+    watchlist_names: str = Field("Materials", description="Comma-separated Robinhood watchlist names to sync")
 
     # Sync configuration
     poll_interval_minutes: int = Field(
@@ -59,10 +58,8 @@ class Settings(BaseSettings):
 
     @property
     def watchlist_name_list(self) -> list[str]:
-        """Return watchlist names as a list. Falls back to watchlist_name if watchlist_names is empty."""
-        if self.watchlist_names:
-            return [n.strip() for n in self.watchlist_names.split(",") if n.strip()]
-        return [self.watchlist_name]
+        """Return watchlist names as a list."""
+        return [n.strip() for n in self.watchlist_names.split(",") if n.strip()]
 
     @property
     def kafka_broker_list(self) -> list[str]:
