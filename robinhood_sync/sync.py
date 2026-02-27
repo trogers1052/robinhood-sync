@@ -263,7 +263,7 @@ class TradeSyncService:
         try:
             logger.info("Starting watchlist sync...")
 
-            watchlist_name = "Resources and assets"
+            watchlist_name = self.settings.watchlist_name
             self.robinhood._rate_limit()
             raw = rh.account.get_watchlist_by_name(name=watchlist_name)
             stocks = raw.get('results', []) if isinstance(raw, dict) else []

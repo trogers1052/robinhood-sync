@@ -36,6 +36,9 @@ class Settings(BaseSettings):
         "robinhood:synced_orders", description="Redis key for synced order IDs set"
     )
 
+    # Watchlist
+    watchlist_name: str = Field("Materials", description="Robinhood watchlist name to sync")
+
     # Sync configuration
     poll_interval_minutes: int = Field(
         10, description="How often to poll Robinhood during market hours (minutes)"
