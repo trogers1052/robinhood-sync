@@ -685,20 +685,27 @@ class RobinhoodClient:
 
         try:
             logger.info(f"Fetching fundamentals for {len(symbols)} symbols...")
-            self._rate_limit()
-            fundamentals = rh.stocks.get_fundamentals(symbols)
 
+            # Robinhood's fundamentals endpoint returns 400 when the query
+            # string exceeds its URL-length limit, so we batch into chunks.
+            batch_size = 25
             result = {}
-            if fundamentals:
-                for i, data in enumerate(fundamentals):
-                    if not data or not isinstance(data, dict):
-                        continue
-                    sym = symbols[i] if i < len(symbols) else None
-                    if sym:
-                        result[sym] = {
-                            "sector": data.get("sector"),
-                            "industry": data.get("industry"),
-                        }
+
+            for start in range(0, len(symbols), batch_size):
+                batch = symbols[start : start + batch_size]
+                self._rate_limit()
+                fundamentals = rh.stocks.get_fundamentals(batch)
+
+                if fundamentals:
+                    for i, data in enumerate(fundamentals):
+                        if not data or not isinstance(data, dict):
+                            continue
+                        sym = batch[i] if i < len(batch) else None
+                        if sym:
+                            result[sym] = {
+                                "sector": data.get("sector"),
+                                "industry": data.get("industry"),
+                            }
 
             logger.info(f"Got fundamentals for {len(result)} symbols")
             return result
