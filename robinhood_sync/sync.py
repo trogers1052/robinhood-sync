@@ -250,9 +250,11 @@ class TradeSyncService:
 
     def sync_watchlist(self) -> tuple[int, int]:
         """
-        Sync watchlist from Robinhood.
+        Sync watchlists from Robinhood.
 
-        Fetches watchlist, syncs to Redis, and publishes Kafka events for changes.
+        Fetches all configured watchlists, merges symbols, enriches with
+        sector/industry from Robinhood fundamentals, syncs to Redis, and
+        publishes Kafka events for changes.
 
         Returns:
             Tuple of (added_count, removed_count).
@@ -263,25 +265,54 @@ class TradeSyncService:
         try:
             logger.info("Starting watchlist sync...")
 
-            watchlist_name = self.settings.watchlist_name
-            self.robinhood._rate_limit()
-            raw = rh.account.get_watchlist_by_name(name=watchlist_name)
-            stocks = raw.get('results', []) if isinstance(raw, dict) else []
+            # Collect stocks from all configured watchlists
+            all_stocks: dict[str, dict] = {}  # symbol -> stock dict (dedup)
+            watchlist_names = self.settings.watchlist_name_list
+
+            for wl_name in watchlist_names:
+                try:
+                    self.robinhood._rate_limit()
+                    raw = rh.account.get_watchlist_by_name(name=wl_name)
+                    wl_stocks = raw.get('results', []) if isinstance(raw, dict) else []
+                    logger.info(f"Watchlist '{wl_name}': {len(wl_stocks)} symbols")
+                    for stock in wl_stocks:
+                        sym = stock.get('symbol')
+                        if sym and sym not in all_stocks:
+                            all_stocks[sym] = stock
+                except Exception as e:
+                    logger.warning(f"Failed to fetch watchlist '{wl_name}': {e}")
+
+            stocks = list(all_stocks.values())
+            logger.info(f"Total unique symbols across {len(watchlist_names)} watchlist(s): {len(stocks)}")
 
             if not stocks:
-                logger.info("No stocks found in Robinhood watchlist")
+                logger.info("No stocks found in Robinhood watchlists")
+
+            # Enrich with sector/industry from Robinhood fundamentals
+            symbols = [s.get('symbol') for s in stocks if s.get('symbol')]
+            if symbols:
+                try:
+                    fundamentals = self.robinhood.get_fundamentals(symbols)
+                    enriched = 0
+                    for stock in stocks:
+                        sym = stock.get('symbol')
+                        if sym and sym in fundamentals:
+                            fund = fundamentals[sym]
+                            if fund.get('sector'):
+                                stock['sector'] = fund['sector']
+                                enriched += 1
+                            if fund.get('industry'):
+                                stock['industry'] = fund['industry']
+                    logger.info(f"Enriched {enriched}/{len(stocks)} symbols with sector/industry")
+                except Exception as e:
+                    logger.warning(f"Failed to enrich with fundamentals (non-fatal): {e}")
 
             # Sync to Redis and get changes
             added_symbols, removed_symbols = self.watchlist_store.sync_watchlist(stocks)
+
             # Publish Kafka events for changes
             if added_symbols or removed_symbols:
-                # Publish overall watchlist update event
-                logger.info(added_symbols)
-                all_symbols = []
-                for stock in stocks:
-                    all_symbols.append(stock.get('symbol'))
-                all_symbols = sorted(all_symbols)
-                logger.info(all_symbols)
+                all_symbols = sorted(s.get('symbol') for s in stocks if s.get('symbol'))
                 self.kafka.publish_watchlist_update(
                     added_symbols=added_symbols,
                     removed_symbols=removed_symbols,
@@ -289,15 +320,15 @@ class TradeSyncService:
                     stocks=stocks,
                 )
 
-                # Publish individual symbol events for granular updates
                 for symbol in added_symbols:
-                    # Find the stock details
                     for s in stocks:
-                        logger.info(s)
                         if s.get('symbol') == symbol:
-                            name = s.get('name') if s else symbol
-                            self.kafka.publish_symbol_added(symbol, name)
-                            logger.info(f"Published symbol added event: {symbol}")
+                            name = s.get('name', symbol)
+                            sector = s.get('sector', '')
+                            industry = s.get('industry', '')
+                            self.kafka.publish_symbol_added(symbol, name, sector, industry)
+                            logger.info(f"Published symbol added event: {symbol} (sector={sector})")
+                            break
 
                 for symbol in removed_symbols:
                     self.kafka.publish_symbol_removed(symbol)

@@ -291,13 +291,15 @@ class TradeEventProducer:
             logger.error(f"Failed to publish watchlist update: {e}")
             return False
 
-    def publish_symbol_added(self, symbol: str, name: str = "") -> bool:
+    def publish_symbol_added(self, symbol: str, name: str = "", sector: str = "", industry: str = "") -> bool:
         """
         Publish an event when a single symbol is added to the watchlist.
 
         Args:
             symbol: Stock symbol that was added.
             name: Optional company name.
+            sector: Optional sector from Robinhood fundamentals.
+            industry: Optional industry from Robinhood fundamentals.
 
         Returns:
             True if published successfully, False otherwise.
@@ -306,14 +308,20 @@ class TradeEventProducer:
             raise RuntimeError("Kafka producer not connected")
 
         try:
+            data = {
+                "symbol": symbol,
+                "name": name or symbol,
+            }
+            if sector:
+                data["sector"] = sector
+            if industry:
+                data["industry"] = industry
+
             event = {
                 "event_type": "WATCHLIST_SYMBOL_ADDED",
                 "source": "robinhood",
                 "timestamp": datetime.utcnow().isoformat() + "Z",
-                "data": {
-                    "symbol": symbol,
-                    "name": name or symbol,
-                },
+                "data": data,
             }
 
             # Use the symbol as the key

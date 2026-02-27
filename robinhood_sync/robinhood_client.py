@@ -100,15 +100,22 @@ class WatchlistStock:
     name: str
     instrument_url: str
     added_at: datetime
+    sector: Optional[str] = None
+    industry: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for Kafka/Redis serialization."""
-        return {
+        d = {
             "symbol": self.symbol,
             "name": self.name,
             "instrument_url": self.instrument_url,
             "added_at": self.added_at.isoformat(),
         }
+        if self.sector:
+            d["sector"] = self.sector
+        if self.industry:
+            d["industry"] = self.industry
+        return d
 
 
 @dataclass
@@ -657,6 +664,48 @@ class RobinhoodClient:
         except Exception as e:
             logger.error(f"Error fetching watchlist: {e}")
             raise
+
+    def get_fundamentals(self, symbols: list[str]) -> dict[str, dict]:
+        """
+        Get sector and industry data for a list of symbols.
+
+        Uses robin_stocks get_fundamentals to fetch sector/industry in bulk.
+
+        Args:
+            symbols: List of stock symbols.
+
+        Returns:
+            Dict mapping symbol to {"sector": ..., "industry": ...}.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        if not symbols:
+            return {}
+
+        try:
+            logger.info(f"Fetching fundamentals for {len(symbols)} symbols...")
+            self._rate_limit()
+            fundamentals = rh.stocks.get_fundamentals(symbols)
+
+            result = {}
+            if fundamentals:
+                for i, data in enumerate(fundamentals):
+                    if not data or not isinstance(data, dict):
+                        continue
+                    sym = symbols[i] if i < len(symbols) else None
+                    if sym:
+                        result[sym] = {
+                            "sector": data.get("sector"),
+                            "industry": data.get("industry"),
+                        }
+
+            logger.info(f"Got fundamentals for {len(result)} symbols")
+            return result
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch fundamentals: {e}")
+            return {}
 
     def get_stop_orders(self) -> list[StopOrder]:
         """
