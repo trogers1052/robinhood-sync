@@ -269,10 +269,22 @@ class TradeSyncService:
             all_stocks: dict[str, dict] = {}  # symbol -> stock dict (dedup)
             watchlist_names = self.settings.watchlist_name_list
 
+            # Build case-insensitive lookup of watchlist name -> id
+            self.robinhood._rate_limit()
+            all_watchlists = rh.account.get_all_watchlists()
+            wl_lookup = {}
+            for wl in all_watchlists.get('results', []):
+                wl_lookup[wl.get('display_name', '').lower()] = wl.get('id', '')
+
             for wl_name in watchlist_names:
                 try:
+                    wl_id = wl_lookup.get(wl_name.lower(), '')
+                    if not wl_id:
+                        logger.warning(f"Watchlist '{wl_name}' not found on Robinhood")
+                        continue
                     self.robinhood._rate_limit()
-                    raw = rh.account.get_watchlist_by_name(name=wl_name)
+                    url = 'https://api.robinhood.com/midlands/lists/items/'
+                    raw = rh.helper.request_get(url, 'list_id', {'list_id': wl_id})
                     wl_stocks = raw.get('results', []) if isinstance(raw, dict) else []
                     logger.info(f"Watchlist '{wl_name}': {len(wl_stocks)} symbols")
                     for stock in wl_stocks:
