@@ -129,6 +129,8 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
         # Always do an initial sync at startup
         logger.info("Performing initial sync at startup...")
         try:
+            import time as _time
+            _initial_start = _time.monotonic()
             new_synced, skipped = service.sync_trades(since_days=sync_days)
             logger.info(f"Initial sync complete: {new_synced} new trades, {skipped} skipped")
             # Also sync current positions
@@ -142,7 +144,11 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
             logger.info(f"Initial stop orders sync: {stop_count} orders")
             # Sync earnings calendar on startup
             earnings_count = service.sync_earnings_calendar()
-            logger.info(f"Initial earnings calendar sync: {earnings_count} symbols")
+            _initial_duration = _time.monotonic() - _initial_start
+            logger.info(
+                f"Initial sync complete in {_initial_duration:.1f}s: "
+                f"earnings={earnings_count} symbols"
+            )
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
             # Continue anyway, will retry in the loop
@@ -205,6 +211,8 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
             logger.info(f"Starting sync #{sync_count}...")
 
             try:
+                import time as _time
+                _sync_start = _time.monotonic()
                 # Use shorter history for incremental syncs
                 incremental_days = min(sync_days, 7)
                 # Also sync current positions
@@ -216,8 +224,10 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                     logger.info(f"Watchlist changes: {added} added, {removed} removed")
                 # Sync stop orders
                 stop_count = service.sync_stop_orders()
+                _sync_duration = _time.monotonic() - _sync_start
                 logger.info(
-                    f"Sync #{sync_count} complete: {new_synced} new trades, {skipped} skipped, {stop_count} stop orders"
+                    f"Sync #{sync_count} complete in {_sync_duration:.1f}s: "
+                    f"{new_synced} new trades, {skipped} skipped, {stop_count} stop orders"
                 )
                 consecutive_failures = 0
 

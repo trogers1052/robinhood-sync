@@ -3,7 +3,7 @@ Main sync logic for Robinhood trade synchronization.
 """
 
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import robin_stocks.robinhood as rh
@@ -196,6 +196,16 @@ class TradeSyncService:
             try:
                 self.position_store.store_positions(positions)
                 self.position_store.store_buying_power(balance)
+
+                # Snapshot opening equity for daily loss circuit breaker.
+                # Only writes on the first sync of each trading day (idempotent).
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if self.position_store.store_daily_equity_open(
+                    balance.total_equity, today_str
+                ):
+                    logger.info(
+                        f"Daily equity opening snapshot: ${balance.total_equity}"
+                    )
             except Exception as redis_err:
                 logger.warning(
                     f"Kafka publish succeeded but Redis cache update failed: {redis_err}. "

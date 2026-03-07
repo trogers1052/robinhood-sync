@@ -4,6 +4,7 @@ Redis client for tracking synced order IDs, storing positions, and managing watc
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Set, TYPE_CHECKING
 
 import redis
@@ -215,7 +216,9 @@ class PositionStore(_RedisBase):
 
     POSITIONS_KEY = "robinhood:positions"
     BUYING_POWER_KEY = "robinhood:buying_power"
+    DAILY_EQUITY_OPEN_KEY = "trading:daily_equity_open"
     POSITIONS_TTL = 3600  # 1 hour TTL for stale position cleanup
+    DAILY_EQUITY_TTL = 86400  # 24 hours
 
     def __init__(self, settings: Settings):
         """
@@ -310,6 +313,49 @@ class PositionStore(_RedisBase):
             return self._with_retry(_do_store)
         except redis.RedisError as e:
             logger.error(f"Failed to store buying power in Redis: {e}")
+            return False
+
+    def store_daily_equity_open(self, equity: "Decimal", date_str: str) -> bool:
+        """
+        Store opening equity for the trading day (daily loss circuit breaker).
+
+        Only writes if no snapshot exists for today — the first sync of the day
+        sets the baseline.  Subsequent calls for the same date are no-ops.
+
+        Args:
+            equity: Total account equity from Robinhood.
+            date_str: Date string in YYYY-MM-DD format.
+
+        Returns:
+            True if a new snapshot was written, False if today's already existed.
+        """
+        if not self._client:
+            raise RuntimeError("Redis client not connected")
+
+        def _do_store():
+            existing = self._client.get(self.DAILY_EQUITY_OPEN_KEY)
+            if existing:
+                try:
+                    data = json.loads(existing)
+                    if data.get("date") == date_str:
+                        return False  # already have today's snapshot
+                except (json.JSONDecodeError, TypeError):
+                    pass  # stale/corrupt data — overwrite
+
+            payload = json.dumps({
+                "equity": str(equity),
+                "date": date_str,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._client.set(
+                self.DAILY_EQUITY_OPEN_KEY, payload, ex=self.DAILY_EQUITY_TTL
+            )
+            return True
+
+        try:
+            return self._with_retry(_do_store)
+        except redis.RedisError as e:
+            logger.error(f"Failed to store daily equity open: {e}")
             return False
 
     def get_positions(self) -> dict:
