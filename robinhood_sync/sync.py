@@ -6,8 +6,6 @@ import logging
 from datetime import date, datetime, timezone
 from typing import Optional
 
-import robin_stocks.robinhood as rh
-
 from .config import Settings
 from .robinhood_client import RobinhoodClient, Trade
 from .kafka_producer import TradeEventProducer
@@ -280,11 +278,7 @@ class TradeSyncService:
             watchlist_names = self.settings.watchlist_name_list
 
             # Build case-insensitive lookup of watchlist name -> id
-            self.robinhood._rate_limit()
-            all_watchlists = rh.account.get_all_watchlists()
-            wl_lookup = {}
-            for wl in all_watchlists.get('results', []):
-                wl_lookup[wl.get('display_name', '').lower()] = wl.get('id', '')
+            wl_lookup = self.robinhood.get_all_watchlist_ids()
 
             for wl_name in watchlist_names:
                 try:
@@ -292,10 +286,7 @@ class TradeSyncService:
                     if not wl_id:
                         logger.warning(f"Watchlist '{wl_name}' not found on Robinhood")
                         continue
-                    self.robinhood._rate_limit()
-                    url = 'https://api.robinhood.com/midlands/lists/items/'
-                    raw = rh.helper.request_get(url, 'list_id', {'list_id': wl_id})
-                    wl_stocks = raw.get('results', []) if isinstance(raw, dict) else []
+                    wl_stocks = self.robinhood.get_watchlist_items_by_id(wl_id)
                     logger.info(f"Watchlist '{wl_name}': {len(wl_stocks)} symbols")
                     for stock in wl_stocks:
                         sym = stock.get('symbol')
@@ -402,8 +393,7 @@ class TradeSyncService:
 
             for symbol in sorted(symbols):
                 try:
-                    self.robinhood._rate_limit()
-                    raw = rh.stocks.get_earnings(symbol)
+                    raw = self.robinhood.get_earnings(symbol)
                     if not raw:
                         # ETF or no earnings data — clear any stale key
                         self.earnings_store.clear_earnings(symbol)

@@ -206,8 +206,6 @@ class RobinhoodClient:
 
             if login_result:
                 self._logged_in = True
-                self.password = None
-                self.totp_secret = None
                 logger.info("Successfully logged in to Robinhood")
                 return True
             else:
@@ -713,6 +711,65 @@ class RobinhoodClient:
         except Exception as e:
             logger.warning(f"Failed to fetch fundamentals: {e}")
             return {}
+
+    def get_all_watchlist_ids(self) -> dict[str, str]:
+        """
+        Get a mapping of watchlist display names (lowercase) to IDs.
+
+        Returns:
+            Dict mapping lowercase display name to watchlist ID.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        self._rate_limit()
+        all_watchlists = rh.account.get_all_watchlists()
+        result = {}
+        for wl in all_watchlists.get('results', []):
+            name = wl.get('display_name', '').lower()
+            wl_id = wl.get('id', '')
+            if name and wl_id:
+                result[name] = wl_id
+        return result
+
+    def get_watchlist_items_by_id(self, wl_id: str) -> list[dict]:
+        """
+        Get stock items from a watchlist by its Robinhood list ID.
+
+        Uses the midlands API which returns symbols directly (more efficient
+        than get_watchlist_by_name which requires per-instrument lookups).
+
+        Args:
+            wl_id: The Robinhood watchlist ID.
+
+        Returns:
+            List of stock dicts with 'symbol' and other fields.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        self._rate_limit()
+        url = 'https://api.robinhood.com/midlands/lists/items/'
+        raw = rh.helper.request_get(url, 'list_id', {'list_id': wl_id})
+        if isinstance(raw, dict):
+            return raw.get('results', [])
+        return []
+
+    def get_earnings(self, symbol: str) -> list[dict]:
+        """
+        Get earnings data for a symbol.
+
+        Args:
+            symbol: Stock ticker symbol.
+
+        Returns:
+            List of earnings quarter dicts, or empty list if none found.
+        """
+        if not self._logged_in:
+            raise RuntimeError("Not logged in to Robinhood")
+
+        self._rate_limit()
+        return rh.stocks.get_earnings(symbol) or []
 
     def get_stop_orders(self) -> list[StopOrder]:
         """
