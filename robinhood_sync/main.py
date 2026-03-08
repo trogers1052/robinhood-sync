@@ -19,6 +19,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from .config import get_settings, Settings
+from .metrics import start_metrics_server
 from .sync import TradeSyncService
 from .scheduler import MarketScheduler
 
@@ -290,6 +291,7 @@ def main():
     load_dotenv()
 
     _start_health_server()
+    start_metrics_server()
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(
