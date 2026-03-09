@@ -4,6 +4,7 @@ Redis client for tracking synced order IDs, storing positions, and managing watc
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional, Set, TYPE_CHECKING
 
@@ -439,6 +440,9 @@ class WatchlistStore(_RedisBase):
             logger.error(f"WatchlistStore failed to connect to Redis: {e}")
             return False
 
+    _MAX_WATCH_RETRIES = 5
+    _WATCH_RETRY_DELAY = 0.1  # seconds; doubles each retry
+
     def sync_watchlist(self, stocks: list["WatchlistStock"]) -> tuple[list[str], list[str]]:
         """
         Sync the watchlist with Redis and return new/removed symbols.
@@ -457,6 +461,7 @@ class WatchlistStore(_RedisBase):
 
         new_symbols = {s.get('symbol') for s in stocks if s.get('symbol')}
         reconnect_attempted = False
+        watch_retries = 0
 
         while True:
             try:
@@ -491,6 +496,18 @@ class WatchlistStore(_RedisBase):
                 return sorted(list(added_symbols)), sorted(list(removed_symbols))
 
             except redis.WatchError:
+                watch_retries += 1
+                if watch_retries > self._MAX_WATCH_RETRIES:
+                    raise RuntimeError(
+                        f"sync_watchlist failed after {self._MAX_WATCH_RETRIES} "
+                        f"WatchError retries — persistent contention on {self.WATCHLIST_KEY}"
+                    )
+                delay = self._WATCH_RETRY_DELAY * (2 ** (watch_retries - 1))
+                logger.warning(
+                    f"WatchError on watchlist sync (attempt {watch_retries}/"
+                    f"{self._MAX_WATCH_RETRIES}), retrying in {delay:.2f}s"
+                )
+                time.sleep(delay)
                 continue
             except (redis.ConnectionError, redis.TimeoutError, ConnectionError, TimeoutError) as e:
                 if not reconnect_attempted:
