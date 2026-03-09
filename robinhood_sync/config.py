@@ -2,13 +2,26 @@
 Configuration management for Robinhood Sync Service.
 """
 
+import os
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, model_validator
 from typing import Optional
+
+SECRETS_DIR = Path("/run/secrets")
+
+
+def _read_secret(name: str) -> Optional[str]:
+    """Read a Docker secret from /run/secrets/<name>."""
+    path = SECRETS_DIR / name
+    if path.is_file():
+        return path.read_text().strip()
+    return None
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    """Application settings loaded from Docker secrets or environment variables."""
 
     # Robinhood credentials
     robinhood_username: str = Field(..., description="Robinhood account username/email")
@@ -16,6 +29,21 @@ class Settings(BaseSettings):
     robinhood_totp_secret: Optional[str] = Field(
         None, description="TOTP secret for 2FA (optional, for automated login)"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _load_docker_secrets(cls, values):
+        """Prefer Docker secrets over environment variables for credentials."""
+        secret_fields = [
+            "robinhood_username",
+            "robinhood_password",
+            "robinhood_totp_secret",
+        ]
+        for field in secret_fields:
+            secret_val = _read_secret(field)
+            if secret_val is not None:
+                values[field] = secret_val
+        return values
 
     # Kafka configuration
     kafka_brokers: str = Field("localhost:19092", description="Kafka broker addresses")

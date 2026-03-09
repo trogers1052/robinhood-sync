@@ -10,6 +10,14 @@ from .config import Settings
 from .robinhood_client import RobinhoodClient, Trade
 from .kafka_producer import TradeEventProducer
 from .redis_client import SyncedOrdersTracker, PositionStore, WatchlistStore, StopOrderStore, EarningsCalendarStore
+from .metrics import (
+    TRADES_SYNCED,
+    TRADES_SKIPPED,
+    POSITIONS,
+    BUYING_POWER,
+    WATCHLIST_SYMBOLS,
+    KAFKA_PUBLISH_ERRORS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +136,7 @@ class TradeSyncService:
         for trade in filled_trades:
             if self.tracker.is_synced(trade.order_id):
                 skipped += 1
+                TRADES_SKIPPED.inc()
             else:
                 new_trades.append(trade)
 
@@ -146,10 +155,13 @@ class TradeSyncService:
             if self.kafka.publish_trade(trade):
                 self.tracker.mark_synced(trade.order_id)
                 synced += 1
+                TRADES_SYNCED.inc()
                 logger.info(
                     f"Synced trade: {trade.side.upper()} {trade.quantity} {trade.symbol} "
                     f"@ ${trade.average_price}"
                 )
+            else:
+                KAFKA_PUBLISH_ERRORS.inc()
 
         logger.info(f"Sync complete: {synced} new trades synced, {skipped} skipped")
 
@@ -176,6 +188,10 @@ class TradeSyncService:
             # Fetch account balance
             balance = self.robinhood.get_account_balance()
 
+            # Update Prometheus gauges
+            POSITIONS.set(len(positions))
+            BUYING_POWER.set(float(balance.buying_power))
+
             # Publish to Kafka first.  Kafka is the durable event log; Redis
             # is a cache derived from it.  By writing Kafka first we ensure
             # that, on partial failure, downstream consumers (decision-engine,
@@ -184,6 +200,7 @@ class TradeSyncService:
             # Redis.  If Redis fails after a successful Kafka publish we log a
             # warning — Redis will be refreshed on the next sync cycle.
             if not self.kafka.publish_positions(positions, balance):
+                KAFKA_PUBLISH_ERRORS.inc()
                 logger.error(
                     "Failed to publish positions to Kafka — aborting Redis write "
                     "to keep both systems consistent"
@@ -346,6 +363,8 @@ class TradeSyncService:
                 for symbol in removed_symbols:
                     self.kafka.publish_symbol_removed(symbol)
                     logger.info(f"Published symbol removed event: {symbol}")
+
+            WATCHLIST_SYMBOLS.set(len(stocks))
 
             logger.info(
                 f"Watchlist sync complete: {len(stocks)} total symbols, "

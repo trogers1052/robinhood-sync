@@ -19,7 +19,13 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from .config import get_settings, Settings
-from .metrics import start_metrics_server
+from .metrics import (
+    start_metrics_server,
+    SYNC_CYCLES,
+    CYCLE_DURATION,
+    CONSECUTIVE_FAILURES,
+    LAST_SUCCESS,
+)
 from .sync import TradeSyncService
 from .scheduler import MarketScheduler
 
@@ -63,6 +69,8 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
             logger.error("Failed to initialize service")
             return 1
 
+        import time as _time
+        _start = _time.monotonic()
         new_synced, skipped = service.sync_trades(since_days=since_days)
         # Also sync current positions
         service.sync_positions()
@@ -72,6 +80,13 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
         stop_count = service.sync_stop_orders()
         # Sync earnings calendar
         earnings_count = service.sync_earnings_calendar()
+        _duration = _time.monotonic() - _start
+
+        SYNC_CYCLES.inc()
+        CYCLE_DURATION.observe(_duration)
+        LAST_SUCCESS.set_to_current_time()
+        CONSECUTIVE_FAILURES.set(0)
+
         logger.info(f"Sync complete: {new_synced} new trades, {skipped} already synced")
         logger.info(f"Watchlist: {added} added, {removed} removed")
         logger.info(f"Stop orders: {stop_count} synced")
@@ -80,6 +95,7 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
 
     except Exception as e:
         logger.error(f"Sync failed: {e}")
+        CONSECUTIVE_FAILURES.set(1)
         return 1
 
     finally:
@@ -150,8 +166,13 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                 f"Initial sync complete in {_initial_duration:.1f}s: "
                 f"earnings={earnings_count} symbols"
             )
+            SYNC_CYCLES.inc()
+            CYCLE_DURATION.observe(_initial_duration)
+            LAST_SUCCESS.set_to_current_time()
+            CONSECUTIVE_FAILURES.set(0)
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
+            CONSECUTIVE_FAILURES.set(1)
             # Continue anyway, will retry in the loop
 
         sync_count = 1
@@ -198,6 +219,7 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                 logger.warning("Service unhealthy, attempting reconnect...")
                 if not service.reconnect():
                     consecutive_failures += 1
+                    CONSECUTIVE_FAILURES.set(consecutive_failures)
                     logger.error(
                         f"Reconnect failed ({consecutive_failures}/{max_consecutive_failures})"
                     )
@@ -206,6 +228,7 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                         return 1
                     continue
                 consecutive_failures = 0
+                CONSECUTIVE_FAILURES.set(0)
 
             # Perform sync
             sync_count += 1
@@ -231,6 +254,10 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
                     f"{new_synced} new trades, {skipped} skipped, {stop_count} stop orders"
                 )
                 consecutive_failures = 0
+                SYNC_CYCLES.inc()
+                CYCLE_DURATION.observe(_sync_duration)
+                LAST_SUCCESS.set_to_current_time()
+                CONSECUTIVE_FAILURES.set(0)
 
                 # Log stats and sync earnings periodically
                 # (every hour = 6 syncs at 10 min intervals)
@@ -242,6 +269,7 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
 
             except Exception as e:
                 consecutive_failures += 1
+                CONSECUTIVE_FAILURES.set(consecutive_failures)
                 logger.error(
                     f"Sync #{sync_count} failed: {e} "
                     f"({consecutive_failures}/{max_consecutive_failures})"

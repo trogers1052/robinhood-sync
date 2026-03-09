@@ -13,6 +13,8 @@ from decimal import Decimal
 import robin_stocks.robinhood as rh
 from dateutil import parser as date_parser
 
+from .metrics import API_CALLS, API_DURATION, API_ERRORS
+
 logger = logging.getLogger(__name__)
 
 
@@ -175,6 +177,32 @@ class RobinhoodClient:
             time.sleep(self._RATE_LIMIT_INTERVAL - elapsed)
         self._last_api_call = time.monotonic()
 
+    def _tracked_api_call(self, endpoint: str, func, *args, **kwargs):
+        """
+        Execute a Robinhood API call with Prometheus instrumentation.
+
+        Applies rate limiting, then records call count, latency, and errors.
+
+        Args:
+            endpoint: Label for the API endpoint (e.g. "orders", "positions").
+            func: Callable that performs the actual API call.
+            *args, **kwargs: Forwarded to *func*.
+
+        Returns:
+            The return value of *func*.
+        """
+        self._rate_limit()
+        API_CALLS.labels(endpoint=endpoint).inc()
+        start = time.monotonic()
+        try:
+            result = func(*args, **kwargs)
+            return result
+        except Exception:
+            API_ERRORS.labels(endpoint=endpoint).inc()
+            raise
+        finally:
+            API_DURATION.labels(endpoint=endpoint).observe(time.monotonic() - start)
+
     def login(self) -> bool:
         """
         Authenticate with Robinhood.
@@ -241,8 +269,9 @@ class RobinhoodClient:
             return self._instrument_cache[instrument_url]
 
         try:
-            self._rate_limit()
-            instrument_data = rh.stocks.get_instrument_by_url(instrument_url)
+            instrument_data = self._tracked_api_call(
+                "instruments", rh.stocks.get_instrument_by_url, instrument_url
+            )
             symbol = instrument_data.get("symbol", "UNKNOWN")
             self._instrument_cache[instrument_url] = symbol
             if len(self._instrument_cache) > self._instrument_cache_max:
@@ -264,8 +293,7 @@ class RobinhoodClient:
 
         try:
             logger.info("Fetching all stock orders from Robinhood...")
-            self._rate_limit()
-            orders = rh.orders.get_all_stock_orders()
+            orders = self._tracked_api_call("orders", rh.orders.get_all_stock_orders)
 
             if not orders:
                 logger.info("No orders found")
@@ -449,8 +477,7 @@ class RobinhoodClient:
             logger.info("Fetching current positions from Robinhood...")
 
             # build_holdings() returns a dict keyed by symbol with position details
-            self._rate_limit()
-            holdings = rh.account.build_holdings()
+            holdings = self._tracked_api_call("positions", rh.account.build_holdings)
 
             if not holdings:
                 logger.info("No positions found")
@@ -496,15 +523,13 @@ class RobinhoodClient:
             logger.info("Fetching account balance from Robinhood...")
 
             # Get account profile for balance info
-            self._rate_limit()
-            profile = rh.profiles.load_account_profile()
+            profile = self._tracked_api_call("account", rh.profiles.load_account_profile)
 
             if not profile:
                 raise RuntimeError("Failed to load account profile")
 
             # Get portfolio info for total equity
-            self._rate_limit()
-            portfolio = rh.profiles.load_portfolio_profile()
+            portfolio = self._tracked_api_call("account", rh.profiles.load_portfolio_profile)
 
             buying_power = Decimal(str(profile.get("buying_power", "0")))
             cash = Decimal(str(profile.get("cash", "0")))
@@ -548,8 +573,7 @@ class RobinhoodClient:
             logger.info(f"Fetching watchlist '{watchlist_name}' from Robinhood...")
 
             # Get all watchlists
-            self._rate_limit()
-            watchlists = rh.account.get_all_watchlists()
+            watchlists = self._tracked_api_call("watchlist", rh.account.get_all_watchlists)
 
             if not watchlists:
                 logger.info("No watchlists found")
@@ -579,8 +603,9 @@ class RobinhoodClient:
 
             # Fetch watchlist items using robin_stocks
             # get_watchlist_by_name returns instrument data
-            self._rate_limit()
-            items = rh.account.get_watchlist_by_name(name=watchlist_name)
+            items = self._tracked_api_call(
+                "watchlist", rh.account.get_watchlist_by_name, name=watchlist_name
+            )
 
             logger.debug(f"get_watchlist_by_name returned type: {type(items)}, length: {len(items) if items else 0}")
             if items:
@@ -620,8 +645,9 @@ class RobinhoodClient:
 
                     # If we have an instrument URL, fetch the details
                     if instrument_url:
-                        self._rate_limit()
-                        instrument = rh.stocks.get_instrument_by_url(instrument_url)
+                        instrument = self._tracked_api_call(
+                            "instruments", rh.stocks.get_instrument_by_url, instrument_url
+                        )
                         if instrument and isinstance(instrument, dict):
                             symbol = instrument.get("symbol", "UNKNOWN")
                             name = instrument.get("simple_name") or instrument.get("name", symbol)
@@ -691,8 +717,9 @@ class RobinhoodClient:
 
             for start in range(0, len(symbols), batch_size):
                 batch = symbols[start : start + batch_size]
-                self._rate_limit()
-                fundamentals = rh.stocks.get_fundamentals(batch)
+                fundamentals = self._tracked_api_call(
+                    "fundamentals", rh.stocks.get_fundamentals, batch
+                )
 
                 if fundamentals:
                     for i, data in enumerate(fundamentals):
@@ -722,8 +749,7 @@ class RobinhoodClient:
         if not self._logged_in:
             raise RuntimeError("Not logged in to Robinhood")
 
-        self._rate_limit()
-        all_watchlists = rh.account.get_all_watchlists()
+        all_watchlists = self._tracked_api_call("watchlist", rh.account.get_all_watchlists)
         result = {}
         for wl in all_watchlists.get('results', []):
             name = wl.get('display_name', '').lower()
@@ -748,9 +774,10 @@ class RobinhoodClient:
         if not self._logged_in:
             raise RuntimeError("Not logged in to Robinhood")
 
-        self._rate_limit()
         url = 'https://api.robinhood.com/midlands/lists/items/'
-        raw = rh.helper.request_get(url, 'list_id', {'list_id': wl_id})
+        raw = self._tracked_api_call(
+            "watchlist", rh.helper.request_get, url, 'list_id', {'list_id': wl_id}
+        )
         if isinstance(raw, dict):
             return raw.get('results', [])
         return []
@@ -768,8 +795,7 @@ class RobinhoodClient:
         if not self._logged_in:
             raise RuntimeError("Not logged in to Robinhood")
 
-        self._rate_limit()
-        return rh.stocks.get_earnings(symbol) or []
+        return self._tracked_api_call("earnings", rh.stocks.get_earnings, symbol) or []
 
     def get_stop_orders(self) -> list[StopOrder]:
         """
@@ -785,8 +811,7 @@ class RobinhoodClient:
             logger.info("Fetching pending stop orders from Robinhood...")
 
             # Get all orders and filter for pending stop orders
-            self._rate_limit()
-            orders = rh.orders.get_all_stock_orders()
+            orders = self._tracked_api_call("stop_orders", rh.orders.get_all_stock_orders)
 
             if not orders:
                 logger.info("No orders found")
@@ -887,8 +912,7 @@ class RobinhoodClient:
             logger.info("Fetching all watchlist symbols...")
 
             # Get all watchlists
-            self._rate_limit()
-            watchlists = rh.account.get_all_watchlists()
+            watchlists = self._tracked_api_call("watchlist", rh.account.get_all_watchlists)
 
             if not watchlists:
                 logger.info("No watchlists found")
