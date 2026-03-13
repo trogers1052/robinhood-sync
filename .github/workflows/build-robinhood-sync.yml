@@ -74,7 +74,7 @@ jobs:
             type=sha,format=long
 
       - name: Build and push Docker image (ARM64)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
