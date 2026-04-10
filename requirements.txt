@@ -21,7 +21,7 @@ python-dateutil==2.9.0.post0
 pyotp==2.9.0
 
 # Metrics
-prometheus-client==0.24.1
+prometheus-client==0.25.0
 
 # Testing
 pytest==9.0.2
