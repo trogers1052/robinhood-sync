@@ -8,7 +8,12 @@ from unittest.mock import Mock, patch, MagicMock
 
 import pytest
 
-from robinhood_sync.robinhood_client import RobinhoodClient, Trade
+from robinhood_sync.robinhood_client import (
+    LoginOutcome,
+    RobinhoodClient,
+    Trade,
+    _classify_login_failure,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,25 +62,78 @@ class TestLogin:
         mock_rh.login.return_value = {"access_token": "abc"}
         c = RobinhoodClient("user", "pass")
         result = c.login()
-        assert result is True
+        assert result == LoginOutcome.SUCCESS
+        assert c.last_login_outcome == LoginOutcome.SUCCESS
         assert c._logged_in is True
         # Credentials preserved for reconnection
         assert c.password == "pass"
 
     @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_failure(self, mock_rh):
+    def test_login_returns_none_classifies_unknown(self, mock_rh):
+        """rh.login() returning None with no challenge signal → UNKNOWN."""
         mock_rh.login.return_value = None
         c = RobinhoodClient("user", "pass")
         result = c.login()
-        assert result is False
+        assert result == LoginOutcome.UNKNOWN
         assert c._logged_in is False
 
     @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_exception(self, mock_rh):
-        mock_rh.login.side_effect = Exception("network error")
+    def test_login_network_exception_classifies_transient(self, mock_rh):
+        mock_rh.login.side_effect = Exception("Connection refused")
         c = RobinhoodClient("user", "pass")
         result = c.login()
-        assert result is False
+        assert result == LoginOutcome.TRANSIENT
+        assert c.last_login_outcome == LoginOutcome.TRANSIENT
+
+    @patch("robinhood_sync.robinhood_client.rh")
+    def test_login_429_classifies_rate_limited(self, mock_rh):
+        """robin_stocks's 429 path crashes with NoneType subscript inside its own try."""
+        def _fake_login(**kwargs):
+            print("Starting login process...")
+            print("Verification required, handling challenge...")
+            print("Starting verification process...")
+            print("Check robinhood app for device approvals method...")
+            print("429 Client Error: Too Many Requests for url: ...")
+            return None
+        mock_rh.login.side_effect = _fake_login
+        c = RobinhoodClient("user", "pass")
+        result = c.login()
+        assert result == LoginOutcome.RATE_LIMITED
+        assert result.is_halt is False  # rate-limited still retryable after long cooldown
+
+    @patch("robinhood_sync.robinhood_client.rh")
+    def test_login_nonetype_subscript_classifies_rate_limited(self, mock_rh):
+        """The exact TypeError pattern from robin_stocks's _validate_sherrif_id on 429."""
+        mock_rh.login.side_effect = TypeError("'NoneType' object is not subscriptable")
+        c = RobinhoodClient("user", "pass")
+        result = c.login()
+        assert result == LoginOutcome.RATE_LIMITED
+
+    @patch("robinhood_sync.robinhood_client.rh")
+    def test_login_device_challenge_classified(self, mock_rh):
+        """Verification workflow detected → halt for human approval."""
+        def _fake_login(**kwargs):
+            print("Starting login process...")
+            print("Verification required, handling challenge...")
+            print("Starting verification process...")
+            print("Check robinhood app for device approvals method...")
+            return None
+        mock_rh.login.side_effect = _fake_login
+        c = RobinhoodClient("user", "pass")
+        result = c.login()
+        assert result == LoginOutcome.DEVICE_CHALLENGE
+        assert result.is_halt is True
+
+    @patch("robinhood_sync.robinhood_client.rh")
+    def test_login_bad_credentials_classified(self, mock_rh):
+        def _fake_login(**kwargs):
+            print("Login failed. Check credentials and try again.")
+            return None
+        mock_rh.login.side_effect = _fake_login
+        c = RobinhoodClient("user", "pass")
+        result = c.login()
+        assert result == LoginOutcome.BAD_CREDENTIALS
+        assert result.is_halt is True
 
     @patch("robinhood_sync.robinhood_client.rh")
     def test_login_with_totp(self, mock_rh):
@@ -93,10 +151,49 @@ class TestLogin:
         with patch.dict(sys.modules, {"pyotp": mock_pyotp}):
             result = c.login()
 
-        assert result is True
+        assert result == LoginOutcome.SUCCESS
         # Verify TOTP code was passed
         _, kwargs = mock_rh.login.call_args
         assert kwargs["mfa_code"] == "123456"
+
+
+class TestClassifier:
+    """Unit tests for _classify_login_failure with synthetic inputs."""
+
+    def test_rate_limit_dominates_challenge(self):
+        # Even when both 429 and challenge markers appear, classify as RATE_LIMITED.
+        stdout = (
+            "Verification required, handling challenge...\n"
+            "Check robinhood app for device approvals method...\n"
+            "429 Client Error: Too Many Requests for url: .../get_prompts_status/\n"
+        )
+        assert _classify_login_failure(stdout, None) == LoginOutcome.RATE_LIMITED
+
+    def test_pure_device_challenge(self):
+        stdout = (
+            "Verification required, handling challenge...\n"
+            "Starting verification process...\n"
+            "Check robinhood app for device approvals method...\n"
+        )
+        assert _classify_login_failure(stdout, None) == LoginOutcome.DEVICE_CHALLENGE
+
+    def test_bad_credentials_signal(self):
+        stdout = "Login failed. Check credentials and try again.\n"
+        assert _classify_login_failure(stdout, None) == LoginOutcome.BAD_CREDENTIALS
+
+    def test_transient_from_exception(self):
+        exc = ConnectionError("Connection reset by peer")
+        assert _classify_login_failure("", exc) == LoginOutcome.TRANSIENT
+
+    def test_unknown_when_silent(self):
+        # rh.login returning None silently with no stdout and no exception
+        # is unclassifiable — surface as UNKNOWN.
+        assert _classify_login_failure("", None) == LoginOutcome.UNKNOWN
+
+    def test_nonetype_subscript_from_stdout(self):
+        # Sometimes robin_stocks prints the error instead of raising.
+        stdout = "Error during login verification: 'NoneType' object is not subscriptable\n"
+        assert _classify_login_failure(stdout, None) == LoginOutcome.RATE_LIMITED
 
 
 # ---------------------------------------------------------------------------

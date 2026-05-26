@@ -79,6 +79,15 @@ class Settings(BaseSettings):
     market_open_hour: int = Field(4, description="Market open hour (ET) - pre-market starts")
     market_close_hour: int = Field(20, description="Market close hour (ET) - after-hours ends")
 
+    # Telegram alerts (optional — used to notify a human when the login
+    # retry loop halts on an unrecoverable auth failure).
+    telegram_bot_token: Optional[str] = Field(
+        None, description="Telegram bot token for halt alerts (optional)"
+    )
+    telegram_chat_id: Optional[str] = Field(
+        None, description="Telegram chat ID to receive halt alerts (optional)"
+    )
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

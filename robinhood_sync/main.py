@@ -26,8 +26,22 @@ from .metrics import (
     CONSECUTIVE_FAILURES,
     LAST_SUCCESS,
 )
+from .robinhood_client import LoginOutcome
 from .sync import TradeSyncService
 from .scheduler import MarketScheduler
+from .telegram_notifier import TelegramNotifier
+
+
+# Login retry policy. Tuned around Robinhood's behavior:
+#   - 429s on get_prompts_status decay over hours, not minutes — short
+#     backoff just keeps the rate-limit bucket full
+#   - Transient blips (DNS, 5xx, container start race) clear in minutes
+#   - A device-approval challenge requires a human; no amount of waiting fixes it
+_TRANSIENT_BACKOFF_BASE_SEC = 600       # 10 minutes
+_TRANSIENT_BACKOFF_CAP_SEC = 21_600     # 6 hours
+_TRANSIENT_MAX_ATTEMPTS = 6
+_RATE_LIMIT_COOLDOWN_SEC = 14_400       # 4 hours
+_RATE_LIMIT_MAX_ATTEMPTS = 3
 
 # Configure logging
 logging.basicConfig(
@@ -102,6 +116,161 @@ def run_once(settings: Settings, since_days: Optional[int] = None) -> int:
         service.cleanup()
 
 
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep that respects the shutdown flag, in 10s increments."""
+    slept = 0.0
+    while slept < seconds and not _shutdown_requested:
+        nap = min(10.0, seconds - slept)
+        time.sleep(nap)
+        slept += nap
+
+
+def _halt_with_alert(
+    notifier: TelegramNotifier,
+    outcome: LoginOutcome,
+    detail: str,
+) -> None:
+    """
+    Send a Telegram alert describing the unrecoverable login failure, then
+    log a final message. Caller is responsible for exiting.
+    """
+    if outcome == LoginOutcome.DEVICE_CHALLENGE:
+        title = "Robinhood device approval required"
+        action = (
+            "Prime a fresh session pickle from your laptop "
+            "(interactive login + tap Approve on phone), then "
+            "scp it to the Pi's robinhood_session volume and "
+            "run `docker start projects-robinhood-sync-1`."
+        )
+    elif outcome == LoginOutcome.BAD_CREDENTIALS:
+        title = "Robinhood login rejected (bad credentials?)"
+        action = (
+            "Verify ROBINHOOD_USERNAME / ROBINHOOD_PASSWORD / "
+            "ROBINHOOD_TOTP_SECRET in the Pi's .env, then restart "
+            "the container."
+        )
+    else:
+        title = f"Robinhood login halted: {outcome.value}"
+        action = (
+            "Login retry budget exhausted. Inspect docker logs "
+            "for projects-robinhood-sync-1 and intervene manually."
+        )
+
+    message = (
+        f"🚨 robinhood-sync halted\n\n"
+        f"{title}\n\n"
+        f"{detail}\n\n"
+        f"Action required:\n{action}\n\n"
+        f"The container will stay stopped until you restart it. "
+        f"This is intentional — auto-retrying past this point is what "
+        f"caused the prior 1,000+ attempt rate-limit incident."
+    )
+    logger.error(f"HALTING login retries: {title} — {detail}")
+    notifier.send(message)
+
+
+def _initialize_with_retries(
+    service: TradeSyncService,
+    notifier: TelegramNotifier,
+) -> LoginOutcome:
+    """
+    Attempt to initialize the service, classifying login failures and
+    routing each failure type to the right retry strategy.
+
+    Returns SUCCESS if initialization completed. Returns the halt-classified
+    outcome (DEVICE_CHALLENGE, BAD_CREDENTIALS, RATE_LIMITED, TRANSIENT, UNKNOWN)
+    if the caller should give up and exit cleanly.
+    """
+    transient_attempts = 0
+    rate_limit_attempts = 0
+
+    # Attempt once unconditionally — even if shutdown is already set we want
+    # to try, otherwise tests that pre-set the shutdown flag (and any
+    # already-in-flight SIGTERM landing during startup) would skip init entirely.
+    while True:
+        if service.initialize():
+            return LoginOutcome.SUCCESS
+
+        # initialize() returned False — was that login, or downstream infra?
+        # If the Robinhood client never logged in, classify and route.
+        # Otherwise (login succeeded but Kafka/Redis failed), treat as transient.
+        client = service.robinhood
+        outcome = (
+            client.last_login_outcome
+            if client is not None
+            else LoginOutcome.UNKNOWN
+        )
+        if outcome == LoginOutcome.SUCCESS:
+            # Login worked but a downstream connector failed — short retry.
+            outcome = LoginOutcome.TRANSIENT
+
+        if outcome.is_halt:
+            _halt_with_alert(
+                notifier,
+                outcome,
+                detail=(
+                    "robin_stocks reported a device-approval verification "
+                    "workflow on this attempt. The Pi cannot complete that "
+                    "challenge headlessly."
+                    if outcome == LoginOutcome.DEVICE_CHALLENGE
+                    else "robin_stocks rejected the credentials without "
+                         "issuing a device challenge."
+                ),
+            )
+            return outcome
+
+        if outcome == LoginOutcome.RATE_LIMITED:
+            rate_limit_attempts += 1
+            if rate_limit_attempts > _RATE_LIMIT_MAX_ATTEMPTS:
+                _halt_with_alert(
+                    notifier,
+                    outcome,
+                    detail=(
+                        f"Robinhood has rate-limited login for "
+                        f"{_RATE_LIMIT_MAX_ATTEMPTS * _RATE_LIMIT_COOLDOWN_SEC // 3600}+ hours. "
+                        f"Refusing to keep retrying."
+                    ),
+                )
+                return outcome
+            wait = _RATE_LIMIT_COOLDOWN_SEC
+            logger.warning(
+                f"Rate-limited by Robinhood "
+                f"({rate_limit_attempts}/{_RATE_LIMIT_MAX_ATTEMPTS}). "
+                f"Sleeping {wait // 3600}h before next attempt."
+            )
+            _interruptible_sleep(wait)
+            if _shutdown_requested:
+                return LoginOutcome.UNKNOWN
+            continue
+
+        # TRANSIENT or UNKNOWN — exponential backoff with hard ceiling
+        transient_attempts += 1
+        if transient_attempts > _TRANSIENT_MAX_ATTEMPTS:
+            _halt_with_alert(
+                notifier,
+                outcome,
+                detail=(
+                    f"Exceeded {_TRANSIENT_MAX_ATTEMPTS} transient login "
+                    f"failures (outcome={outcome.value}). "
+                    f"Refusing to keep retrying — likely something deeper is broken."
+                ),
+            )
+            return outcome
+        wait = min(
+            _TRANSIENT_BACKOFF_BASE_SEC * (2 ** (transient_attempts - 1)),
+            _TRANSIENT_BACKOFF_CAP_SEC,
+        )
+        logger.warning(
+            f"Transient login/init failure "
+            f"({transient_attempts}/{_TRANSIENT_MAX_ATTEMPTS}, "
+            f"outcome={outcome.value}). Retrying in {wait // 60}m."
+        )
+        _interruptible_sleep(wait)
+
+        if _shutdown_requested:
+            return LoginOutcome.UNKNOWN
+
+
 def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
     """
     Run continuous sync with market-hours-aware scheduling.
@@ -129,10 +298,17 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
 
     logger.info("Go Bears!!!!")
 
+    notifier = TelegramNotifier(
+        bot_token=settings.telegram_bot_token,
+        chat_id=settings.telegram_chat_id,
+    )
+
     try:
-        if not service.initialize():
-            logger.error("Failed to initialize service")
-            return 1
+        init_outcome = _initialize_with_retries(service, notifier)
+        if init_outcome != LoginOutcome.SUCCESS:
+            # Halt cleanly. With docker-compose `restart: unless-stopped`,
+            # exit-code 0 leaves the container stopped until a human acts.
+            return 0
 
         # Log startup info
         logger.info("=" * 60)

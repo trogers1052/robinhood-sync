@@ -7,6 +7,7 @@ import pytest
 
 import robinhood_sync.main as main
 from robinhood_sync.config import Settings
+from robinhood_sync.robinhood_client import LoginOutcome
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +17,12 @@ def reset_shutdown():
     main._shutdown_requested = False
 
 
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Make _interruptible_sleep a no-op so retry-loop tests don't actually wait."""
+    monkeypatch.setattr(main, "_interruptible_sleep", lambda _s: None)
+
+
 @pytest.fixture
 def mock_settings():
     s = Mock(spec=Settings)
@@ -23,10 +30,13 @@ def mock_settings():
     s.market_close_hour = 20
     s.poll_interval_minutes = 10
     s.sync_history_days = 30
+    # Telegram disabled by default so halt path doesn't fire real HTTP.
+    s.telegram_bot_token = None
+    s.telegram_chat_id = None
     return s
 
 
-def _mock_service():
+def _mock_service(login_outcome: LoginOutcome = LoginOutcome.SUCCESS):
     svc = Mock()
     svc.initialize.return_value = True
     svc.cleanup.return_value = None
@@ -38,6 +48,9 @@ def _mock_service():
     svc.is_healthy.return_value = True
     svc.reconnect.return_value = True
     svc.get_sync_stats.return_value = {"total_synced_orders": 42}
+    # Mirror the real RobinhoodClient surface used by the retry loop.
+    svc.robinhood = Mock()
+    svc.robinhood.last_login_outcome = login_outcome
     return svc
 
 
@@ -108,14 +121,27 @@ class TestRunContinuousInitial:
         svc.sync_stop_orders.assert_called_once()
         svc.sync_earnings_calendar.assert_called_once()
 
-    def test_init_failure_returns_1(self, mock_settings):
-        svc = _mock_service()
+    def test_init_failure_on_device_challenge_halts_clean(self, mock_settings):
+        """Halt on device challenge must exit 0 so docker-compose won't auto-restart."""
+        svc = _mock_service(login_outcome=LoginOutcome.DEVICE_CHALLENGE)
         svc.initialize.return_value = False
         scheduler = Mock()
         with patch.object(main, "TradeSyncService", return_value=svc), \
              patch.object(main, "MarketScheduler", return_value=scheduler):
             rc = main.run_continuous(mock_settings)
-        assert rc == 1
+        assert rc == 0
+
+    def test_init_failure_transient_exhausted_halts_clean(self, mock_settings):
+        """After exceeding the transient budget, halt cleanly with exit 0."""
+        svc = _mock_service(login_outcome=LoginOutcome.TRANSIENT)
+        svc.initialize.return_value = False
+        scheduler = Mock()
+        with patch.object(main, "TradeSyncService", return_value=svc), \
+             patch.object(main, "MarketScheduler", return_value=scheduler):
+            rc = main.run_continuous(mock_settings)
+        assert rc == 0
+        # Retry budget was actually consumed
+        assert svc.initialize.call_count >= main._TRANSIENT_MAX_ATTEMPTS
 
     def test_initial_sync_exception_continues(self, mock_settings):
         """Initial sync exception is caught, loop continues (returns 0 since shutdown is True)."""

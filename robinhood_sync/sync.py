@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from typing import Optional
 
 from .config import Settings
-from .robinhood_client import RobinhoodClient, Trade
+from .robinhood_client import LoginOutcome, RobinhoodClient, Trade
 from .kafka_producer import TradeEventProducer
 from .redis_client import SyncedOrdersTracker, PositionStore, WatchlistStore, StopOrderStore, EarningsCalendarStore
 from .metrics import (
@@ -53,8 +53,9 @@ class TradeSyncService:
             totp_secret=self.settings.robinhood_totp_secret,
         )
 
-        if not self.robinhood.login():
-            logger.error("Failed to login to Robinhood")
+        if self.robinhood.login() != LoginOutcome.SUCCESS:
+            # The login() call already classified and logged the failure.
+            # Inspect robinhood.last_login_outcome to choose retry/halt strategy.
             return False
 
         # Initialize Kafka producer

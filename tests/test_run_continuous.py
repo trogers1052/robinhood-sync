@@ -22,6 +22,8 @@ def mock_settings():
     settings.market_close_hour = 20
     settings.poll_interval_minutes = 10
     settings.sync_history_days = 30
+    settings.telegram_bot_token = None
+    settings.telegram_chat_id = None
     return settings
 
 

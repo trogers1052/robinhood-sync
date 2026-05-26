@@ -2,13 +2,16 @@
 Robinhood API client wrapper using robin_stocks library.
 """
 
+import io
 import logging
 import time
 from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from contextlib import redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
+from typing import Optional
 
 import robin_stocks.robinhood as rh
 from dateutil import parser as date_parser
@@ -16,6 +19,87 @@ from dateutil import parser as date_parser
 from .metrics import API_CALLS, API_DURATION, API_ERRORS
 
 logger = logging.getLogger(__name__)
+
+
+class LoginOutcome(str, Enum):
+    """
+    Classified result of an attempted Robinhood login.
+
+    The retry loop in main.py uses this to decide whether to back off,
+    halt and alert, or treat the failure as transient.
+    """
+
+    SUCCESS = "success"
+    # Network/DNS/5xx — safe to retry with backoff
+    TRANSIENT = "transient"
+    # HTTP 429 from get_prompts_status — must wait hours, not minutes
+    RATE_LIMITED = "rate_limited"
+    # Robinhood demands a device approval push on the user's phone.
+    # The Pi cannot complete this; halt and alert a human.
+    DEVICE_CHALLENGE = "device_challenge"
+    # rh.login() returned falsy with no challenge signal — likely creds.
+    BAD_CREDENTIALS = "bad_credentials"
+    # Anything else we couldn't classify confidently.
+    UNKNOWN = "unknown"
+
+    @property
+    def is_halt(self) -> bool:
+        """True if this outcome requires human intervention (no retry)."""
+        return self in (LoginOutcome.DEVICE_CHALLENGE, LoginOutcome.BAD_CREDENTIALS)
+
+
+def _classify_login_failure(stdout: str, exception: Optional[BaseException]) -> LoginOutcome:
+    """
+    Inspect robin_stocks's stdout and the raised exception (if any) to
+    classify a failed login attempt.
+
+    robin_stocks prints challenge state to stdout rather than raising,
+    so we capture stdout to read it. The 429 path inside its
+    `_validate_sherrif_id` typically crashes with
+    `TypeError: 'NoneType' object is not subscriptable` when it tries to
+    parse the rate-limited response as JSON.
+    """
+    stdout_lower = stdout.lower()
+    exc_str = (str(exception) or "").lower() if exception else ""
+    exc_type = type(exception).__name__ if exception else ""
+
+    # Rate-limited — most urgent classification, must dominate over device-challenge
+    # because a 429 *is* a device-challenge polling response, but treating it as
+    # "challenge required" leads to more retries which makes the 429 worse.
+    if "429" in stdout or "too many requests" in stdout_lower:
+        return LoginOutcome.RATE_LIMITED
+    if "'nonetype' object is not subscriptable" in exc_str or \
+       "'nonetype' object is not subscriptable" in stdout_lower:
+        return LoginOutcome.RATE_LIMITED
+
+    # Device-approval challenge was demanded (regardless of whether it timed out
+    # or the user approved late).
+    challenge_markers = (
+        "verification required",
+        "verification_workflow",
+        "device approvals",
+        "approve the login request",
+        "starting verification process",
+    )
+    if any(m in stdout_lower for m in challenge_markers):
+        return LoginOutcome.DEVICE_CHALLENGE
+    if exc_type in ("TimeoutError",) and "verification" in exc_str:
+        return LoginOutcome.DEVICE_CHALLENGE
+    if "challenge_status" in exc_str or "'status'" in exc_str:
+        return LoginOutcome.DEVICE_CHALLENGE
+
+    # Bad creds — robin_stocks prints this when the username/password is rejected
+    # without a challenge being issued.
+    if "check credentials" in stdout_lower or "incorrect login" in stdout_lower:
+        return LoginOutcome.BAD_CREDENTIALS
+
+    # Network-ish exceptions or unrecognized failure — safe to retry transiently.
+    transient_markers = ("connection", "timeout", "temporarily unavailable", "dns",
+                         "name or service not known", "max retries exceeded")
+    if any(m in exc_str for m in transient_markers):
+        return LoginOutcome.TRANSIENT
+
+    return LoginOutcome.UNKNOWN
 
 
 @dataclass
@@ -165,6 +249,7 @@ class RobinhoodClient:
         self.password = password
         self.totp_secret = totp_secret
         self._logged_in = False
+        self._last_login_outcome: LoginOutcome = LoginOutcome.UNKNOWN
         self._instrument_cache: OrderedDict[str, str] = OrderedDict()  # URL -> symbol
         self._instrument_cache_max = 1000
         self._last_api_call: float = 0.0
@@ -203,46 +288,74 @@ class RobinhoodClient:
         finally:
             API_DURATION.labels(endpoint=endpoint).observe(time.monotonic() - start)
 
-    def login(self) -> bool:
+    def login(self) -> LoginOutcome:
         """
-        Authenticate with Robinhood.
+        Authenticate with Robinhood and classify the result.
 
         Returns:
-            True if login successful, False otherwise.
-        """
-        try:
-            logger.info(f"Logging in to Robinhood as {self.username}...")
+            LoginOutcome — SUCCESS on success, or one of the failure
+            classifications (DEVICE_CHALLENGE, RATE_LIMITED, BAD_CREDENTIALS,
+            TRANSIENT, UNKNOWN). Callers should use `LoginOutcome.is_halt`
+            to decide whether to retry or surface to a human.
 
-            # Generate TOTP code if secret provided
-            mfa_code = None
+        The previous bool-returning signature is preserved at the call sites
+        via the truthiness of SUCCESS (kept distinct here so we can route
+        retries intelligently in main.py).
+        """
+        logger.info(f"Logging in to Robinhood as {self.username}...")
+
+        # Generate TOTP code if secret provided
+        mfa_code = None
+        try:
             if self.totp_secret:
                 import pyotp
                 totp = pyotp.TOTP(self.totp_secret)
                 mfa_code = totp.now()
                 logger.info("Generated TOTP code for 2FA")
-
-            # Login with robin_stocks
-            # store_session=True is required — robin_stocks persists the
-            # device-approval token so headless restarts don't re-trigger
-            # Robinhood's interactive device approval flow.
-            login_result = rh.login(
-                username=self.username,
-                password=self.password,
-                mfa_code=mfa_code,
-                store_session=True,
-            )
-
-            if login_result:
-                self._logged_in = True
-                logger.info("Successfully logged in to Robinhood")
-                return True
-            else:
-                logger.error("Failed to login to Robinhood")
-                return False
-
         except Exception as e:
-            logger.error(f"Error during Robinhood login: {e}")
-            return False
+            logger.error(f"Error generating TOTP code: {e}")
+            return LoginOutcome.UNKNOWN
+
+        # robin_stocks prints challenge state to stdout (not via logging) and
+        # swallows certain errors internally. Capture stdout so we can classify
+        # the failure mode after the fact.
+        captured = io.StringIO()
+        login_exc: Optional[BaseException] = None
+        login_result = None
+        try:
+            with redirect_stdout(captured):
+                # store_session=True is required — robin_stocks persists the
+                # device-approval token so headless restarts don't re-trigger
+                # Robinhood's interactive device approval flow.
+                login_result = rh.login(
+                    username=self.username,
+                    password=self.password,
+                    mfa_code=mfa_code,
+                    store_session=True,
+                )
+        except BaseException as exc:  # noqa: BLE001 — we classify below
+            login_exc = exc
+
+        stdout = captured.getvalue()
+        if stdout.strip():
+            # Echo robin_stocks's output through our logger so it shows up in
+            # `docker logs` alongside our own messages.
+            for line in stdout.strip().splitlines():
+                logger.info(f"robin_stocks: {line}")
+
+        if login_result and not login_exc:
+            self._logged_in = True
+            self._last_login_outcome = LoginOutcome.SUCCESS
+            logger.info("Successfully logged in to Robinhood")
+            return LoginOutcome.SUCCESS
+
+        outcome = _classify_login_failure(stdout, login_exc)
+        self._last_login_outcome = outcome
+        if login_exc:
+            logger.error(f"Login failed: outcome={outcome.value} exc={login_exc!r}")
+        else:
+            logger.error(f"Login failed: outcome={outcome.value}")
+        return outcome
 
     def logout(self) -> None:
         """Logout from Robinhood."""
@@ -256,6 +369,11 @@ class RobinhoodClient:
     def is_logged_in(self) -> bool:
         """Check if currently logged in."""
         return self._logged_in
+
+    @property
+    def last_login_outcome(self) -> LoginOutcome:
+        """Outcome of the most recent login() attempt."""
+        return self._last_login_outcome
 
     def _get_symbol_from_instrument(self, instrument_url: str) -> str:
         """

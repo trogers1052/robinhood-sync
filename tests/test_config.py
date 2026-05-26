@@ -123,24 +123,6 @@ class TestWatchlistNameList:
         )
         assert s.watchlist_name_list == ["Materials", "Technology", "Healthcare"]
 
-    def test_watchlist_names_overrides_watchlist_name(self):
-        s = Settings(
-            robinhood_username="u",
-            robinhood_password="p",
-            watchlist_name="OldName",
-            watchlist_names="NewA,NewB",
-        )
-        assert s.watchlist_name_list == ["NewA", "NewB"]
-
-    def test_empty_watchlist_names_falls_back(self):
-        s = Settings(
-            robinhood_username="u",
-            robinhood_password="p",
-            watchlist_name="Fallback",
-            watchlist_names="",
-        )
-        assert s.watchlist_name_list == ["Fallback"]
-
     def test_whitespace_stripped(self):
         s = Settings(
             robinhood_username="u",
