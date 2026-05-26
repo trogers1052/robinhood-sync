@@ -16,6 +16,10 @@ from typing import Optional
 import robin_stocks.robinhood as rh
 from dateutil import parser as date_parser
 
+# Importing auth_patch installs a 429-aware replacement for robin_stocks's
+# _validate_sherrif_id BEFORE any login() call runs. Must precede any code
+# that touches rh.login.
+from . import auth_patch  # noqa: F401 — import for side effect
 from .metrics import API_CALLS, API_DURATION, API_ERRORS
 
 logger = logging.getLogger(__name__)
