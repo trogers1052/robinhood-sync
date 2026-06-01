@@ -55,7 +55,7 @@ python -m robinhood_sync.main --debug
 | `DB_HOST` | PostgreSQL host | `localhost` |
 | `DB_PORT` | PostgreSQL port | `5432` |
 | `DB_USER` | PostgreSQL user | `trader` |
-| `DB_PASSWORD` | PostgreSQL password | `trader5` |
+| `DB_PASSWORD` | PostgreSQL password | `your_db_password` |
 | `DB_NAME` | PostgreSQL database | `trading_platform` |
 | `POLL_INTERVAL_SECONDS` | Polling interval | `300` (5 min) |
 | `SYNC_HISTORY_DAYS` | Days of history on first run | `30` |
