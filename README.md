@@ -6,10 +6,12 @@ Automatically syncs your Robinhood trades to Kafka for processing by other servi
 
 - Fetches all filled stock orders from Robinhood
 - Publishes trade events to Kafka topic `trading.orders`
-- Tracks synced orders to avoid duplicates
+- Tracks synced orders in Redis to avoid duplicates
+- Also syncs positions, account balance, stop orders, watchlist, and the earnings calendar to Redis/Kafka
 - Supports 2FA with TOTP
-- Runs continuously with configurable polling interval
-- Or run once for initial historical sync
+- Supports Docker secrets for credentials (`/run/secrets/`)
+- Runs continuously with a configurable, market-hours-aware polling interval
+- Or run once for an initial historical sync
 
 ## Quick Start
 
@@ -36,7 +38,7 @@ python -m robinhood_sync.main --once
 # Sync only last 7 days
 python -m robinhood_sync.main --once --days 7
 
-# Run continuously (polls every 5 minutes by default)
+# Run continuously (polls every 10 minutes by default, during market hours)
 python -m robinhood_sync.main
 
 # Run with debug logging
@@ -45,6 +47,8 @@ python -m robinhood_sync.main --debug
 
 ## Configuration
 
+Configuration is loaded via `pydantic-settings` from environment variables (or a `.env` file). Credentials may alternatively be supplied as **Docker secrets** in `/run/secrets/` (`robinhood_username`, `robinhood_password`, `robinhood_totp_secret`), which take precedence over environment variables.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ROBINHOOD_USERNAME` | Your Robinhood email | **Required** |
@@ -52,13 +56,20 @@ python -m robinhood_sync.main --debug
 | `ROBINHOOD_TOTP_SECRET` | TOTP secret for 2FA | Optional |
 | `KAFKA_BROKERS` | Kafka broker addresses | `localhost:19092` |
 | `KAFKA_TOPIC` | Topic for trade events | `trading.orders` |
-| `DB_HOST` | PostgreSQL host | `localhost` |
-| `DB_PORT` | PostgreSQL port | `5432` |
-| `DB_USER` | PostgreSQL user | `trader` |
-| `DB_PASSWORD` | PostgreSQL password | `your_db_password` |
-| `DB_NAME` | PostgreSQL database | `trading_platform` |
-| `POLL_INTERVAL_SECONDS` | Polling interval | `300` (5 min) |
+| `KAFKA_POSITIONS_TOPIC` | Topic for position snapshots | `trading.positions` |
+| `KAFKA_WATCHLIST_TOPIC` | Topic for watchlist events | `trading.watchlist` |
+| `REDIS_HOST` | Redis host (synced-order tracking + caches) | `localhost` |
+| `REDIS_PORT` | Redis port | `6379` |
+| `REDIS_PASSWORD` | Redis password | Optional |
+| `REDIS_DB` | Redis database number | `0` |
+| `REDIS_SYNCED_ORDERS_KEY` | Redis set key for synced order IDs | `robinhood:synced_orders` |
+| `WATCHLIST_NAMES` | Comma-separated Robinhood watchlist names to sync | `Materials` |
+| `POLL_INTERVAL_MINUTES` | Polling interval during market hours (minutes) | `10` |
 | `SYNC_HISTORY_DAYS` | Days of history on first run | `30` |
+| `MARKET_OPEN_HOUR` | Market open hour, ET (pre-market start) | `4` |
+| `MARKET_CLOSE_HOUR` | Market close hour, ET (after-hours end) | `20` |
+| `TELEGRAM_BOT_TOKEN` | Bot token for halt alerts | Optional |
+| `TELEGRAM_CHAT_ID` | Chat ID for halt alerts | Optional |
 
 ## Trade Event Schema
 
@@ -101,7 +112,7 @@ docker run --rm \
   -e ROBINHOOD_USERNAME=your_email \
   -e ROBINHOOD_PASSWORD=your_password \
   -e KAFKA_BROKERS=trading-redpanda:9092 \
-  -e DB_HOST=trading-db \
+  -e REDIS_HOST=trading-redis \
   robinhood-sync python -m robinhood_sync.main --once
 
 # Run continuously
@@ -112,7 +123,7 @@ docker run -d \
   -e ROBINHOOD_USERNAME=your_email \
   -e ROBINHOOD_PASSWORD=your_password \
   -e KAFKA_BROKERS=trading-redpanda:9092 \
-  -e DB_HOST=trading-db \
+  -e REDIS_HOST=trading-redis \
   robinhood-sync
 ```
 
@@ -131,19 +142,21 @@ docker run -d \
 │                     │
 │ • Parse orders      │
 │ • Filter filled     │
-│ • Skip duplicates   │
+│ • Skip duplicates   │  ◀── checks Redis set before publishing
 └──────────┬──────────┘
            │
-     ┌─────┴─────┐
-     ▼           ▼
-┌─────────┐  ┌─────────────┐
-│ Kafka   │  │ PostgreSQL  │
-│ Topic   │  │ (tracking)  │
-│         │  │             │
-│ trading │  │ robinhood_  │
-│ .orders │  │ synced_     │
-│         │  │ orders      │
-└─────────┘  └─────────────┘
+     ┌─────┴───────────┐
+     ▼                 ▼
+┌─────────┐  ┌──────────────────────┐
+│ Kafka   │  │ Redis                │
+│ Topic   │  │                      │
+│         │  │ SET robinhood:       │
+│ trading │  │   synced_orders      │  (dedup tracking)
+│ .orders │  │ + positions,         │
+│         │  │   watchlist,         │
+│         │  │   stop orders,       │
+│         │  │   earnings caches    │
+└─────────┘  └──────────────────────┘
      │
      ▼
 ┌─────────────────────┐
@@ -152,6 +165,11 @@ docker run -d \
 │  (consumer)         │
 └─────────────────────┘
 ```
+
+**Deduplication:** every filled order's ID is checked against the Redis set
+(`REDIS_SYNCED_ORDERS_KEY`, default `robinhood:synced_orders`) before publishing.
+Once a trade is published to Kafka, its order ID is added to the set so it is
+never re-emitted. No relational database is used.
 
 ## Security Notes
 
@@ -178,21 +196,22 @@ Robinhood may require additional verification:
 
 ### Orders not appearing
 - Make sure orders are in "filled" state
-- Check the date range with `--days` parameter
-- Verify Kafka connection with `make kafka-check`
+- Check the date range with the `--days` parameter
+- Verify the broker is reachable at `KAFKA_BROKERS` and that Redis is up at `REDIS_HOST:REDIS_PORT`
+- An already-synced order will be skipped; inspect the Redis set (`SMEMBERS robinhood:synced_orders`) to confirm whether it was previously published
 
 ## Development
 
+Dependencies (including the test tooling) are pinned in `requirements.txt` —
+there is no `pyproject.toml`. Install them and run the test suite with `pytest`
+(configured via `pytest.ini`):
+
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+# Install dependencies
+pip install -r requirements.txt
 
-# Run tests
+# Run the test suite (config lives in pytest.ini)
 pytest
-
-# Format code
-black robinhood_sync/
-isort robinhood_sync/
 ```
 
 ## Resources
@@ -200,3 +219,9 @@ isort robinhood_sync/
 - [robin-stocks Documentation](https://robin-stocks.readthedocs.io/)
 - [robin-stocks GitHub](https://github.com/jmfernandes/robin_stocks)
 - [Kafka Python Documentation](https://kafka-python.readthedocs.io/)
+
+---
+
+## Built with Claude Code
+
+A large portion of this project — implementation, tests, and documentation — was written in pair-programming sessions with [Claude Code](https://claude.com/claude-code), Anthropic's agentic command-line tool.
