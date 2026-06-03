@@ -20,20 +20,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _module_redis_client(**kwargs) -> redis.Redis:
+    """Build a ``redis.Redis`` via this module's ``redis`` reference.
+
+    Used as the shared base's ``client_factory`` so the connection is still
+    constructed through ``robinhood_sync.redis_client.redis.Redis`` (the
+    patch target the tests rely on) without overriding ``_create_client``.
+    The lookup is deliberately lazy — resolved at call time — so a
+    ``patch("robinhood_sync.redis_client.redis.Redis")`` is honoured.
+    """
+    return redis.Redis(**kwargs)
+
+
 class _RedisBase(RedisBase):
     """Base class providing Redis connection and reconnection logic.
 
     Thin adapter over :class:`trading_commons.redisx.RedisBase`. It keeps the
-    service's ``Settings``-based constructor and the ``_reconnect`` /
-    ``_create_client`` surface the stores and tests rely on, while delegating
-    the connection lifecycle and retry/backoff machinery to the shared base.
+    service's ``Settings``-based constructor and the ``_reconnect`` surface the
+    stores and tests rely on, while delegating the connection lifecycle and
+    retry/backoff machinery to the shared base.
 
     Behavior is preserved exactly:
 
     - One reconnect-and-retry on a transient error, then re-raise
-      (``max_retries=1``, ``backoff_base=0`` → no sleeps).
-    - ``_create_client`` binds to this module's ``redis.Redis`` and passes the
-      same socket timeouts / ``retry_on_timeout`` as before.
+      (``max_retries=1``, ``backoff_base=0`` → no sleeps). This is *not* the
+      same as the base's ``max_retries=0`` no-retry path, so the pin stays.
+    - The client is built via this module's ``redis.Redis`` (through the
+      ``client_factory`` seam) with the same socket timeouts /
+      ``retry_on_timeout`` as before.
     """
 
     def __init__(self, settings: Settings):
@@ -48,19 +62,8 @@ class _RedisBase(RedisBase):
             max_retries=1,
             backoff_base=0,
             decode_responses=True,
-        )
-
-    def _create_client(self) -> redis.Redis:
-        """Create a new Redis client instance (bound to this module's redis)."""
-        return redis.Redis(
-            host=self.settings.redis_host,
-            port=self.settings.redis_port,
-            password=self.settings.redis_password,
-            db=self.settings.redis_db,
-            decode_responses=True,
-            socket_timeout=5,
-            socket_connect_timeout=5,
             retry_on_timeout=True,
+            client_factory=_module_redis_client,
         )
 
     def _reconnect(self) -> bool:

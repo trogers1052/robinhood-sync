@@ -1,7 +1,7 @@
 # Robinhood Sync Service Dependencies (pinned to production versions)
 
 # Shared platform infrastructure (metrics shim, Redis base, Telegram, daemon, config)
-trading-py-commons @ git+https://github.com/trogers1052/trading-py-commons.git@v0.1.0
+trading-py-commons @ git+https://github.com/trogers1052/trading-py-commons.git@v0.2.0
 
 # Robinhood API
 robin-stocks==3.4.0
