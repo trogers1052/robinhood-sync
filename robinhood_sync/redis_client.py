@@ -10,6 +10,8 @@ from typing import Optional, Set, TYPE_CHECKING
 
 import redis
 
+from trading_commons.redisx import RedisBase
+
 from .config import Settings
 
 if TYPE_CHECKING:
@@ -18,15 +20,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _RedisBase:
-    """Base class providing Redis connection and reconnection logic."""
+class _RedisBase(RedisBase):
+    """Base class providing Redis connection and reconnection logic.
+
+    Thin adapter over :class:`trading_commons.redisx.RedisBase`. It keeps the
+    service's ``Settings``-based constructor and the ``_reconnect`` /
+    ``_create_client`` surface the stores and tests rely on, while delegating
+    the connection lifecycle and retry/backoff machinery to the shared base.
+
+    Behavior is preserved exactly:
+
+    - One reconnect-and-retry on a transient error, then re-raise
+      (``max_retries=1``, ``backoff_base=0`` → no sleeps).
+    - ``_create_client`` binds to this module's ``redis.Redis`` and passes the
+      same socket timeouts / ``retry_on_timeout`` as before.
+    """
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._client: Optional[redis.Redis] = None
+        super().__init__(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            db=settings.redis_db,
+            password=settings.redis_password,
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            max_retries=1,
+            backoff_base=0,
+            decode_responses=True,
+        )
 
     def _create_client(self) -> redis.Redis:
-        """Create a new Redis client instance."""
+        """Create a new Redis client instance (bound to this module's redis)."""
         return redis.Redis(
             host=self.settings.redis_host,
             port=self.settings.redis_port,
@@ -39,53 +64,15 @@ class _RedisBase:
         )
 
     def _reconnect(self) -> bool:
-        """
-        Attempt to reconnect to Redis by creating a new client.
+        """Reconnect to Redis (delegates to the shared base's ``reconnect``)."""
+        return super().reconnect()
 
-        Returns:
-            True if reconnection successful, False otherwise.
-        """
-        logger.warning(f"{self.__class__.__name__} attempting Redis reconnection...")
-        try:
-            if self._client:
-                try:
-                    self._client.close()
-                except Exception:
-                    pass
-            self._client = self._create_client()
-            self._client.ping()
-            logger.info(f"{self.__class__.__name__} reconnected to Redis")
-            return True
-        except redis.RedisError as e:
-            logger.error(f"{self.__class__.__name__} reconnection failed: {e}")
-            self._client = None
-            return False
-
-    def _with_retry(self, func, *args, **kwargs):
-        """
-        Execute a Redis operation with one reconnection retry on connection failure.
-
-        Args:
-            func: Callable that performs the Redis operation.
-            *args: Positional arguments passed to func.
-            **kwargs: Keyword arguments passed to func.
-
-        Returns:
-            The return value of func.
-
-        Raises:
-            The original exception if retry also fails.
-        """
-        try:
-            return func(*args, **kwargs)
-        except (redis.ConnectionError, redis.TimeoutError, ConnectionError, TimeoutError) as e:
-            logger.warning(f"{self.__class__.__name__} Redis operation failed: {e}, retrying after reconnect")
-            if self._reconnect():
-                return func(*args, **kwargs)
-            raise
+    def reconnect(self) -> bool:
+        """Override so the shared ``_with_retry`` honours a patched ``_reconnect``."""
+        return self._reconnect()
 
     def close(self) -> None:
-        """Close the Redis connection."""
+        """Close the Redis connection (preserves original: keeps the client ref)."""
         if self._client:
             self._client.close()
             logger.info(f"{self.__class__.__name__} Redis connection closed")

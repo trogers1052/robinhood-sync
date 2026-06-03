@@ -1,27 +1,30 @@
 """
 Configuration management for Robinhood Sync Service.
+
+``Settings`` subclasses the shared :class:`trading_commons.config.BaseServiceSettings`,
+which provides the Kafka / Redis / Telegram blocks, the ``kafka_broker_list`` and
+``redis_url`` helpers, and Docker-secrets support. Robinhood-specific fields and
+the original Docker-secrets scope (only the robinhood_* credentials) are preserved
+here so behavior is identical to the previous standalone Settings.
 """
 
-import os
-from pathlib import Path
+from typing import ClassVar, Optional
 
-from pydantic_settings import BaseSettings
-from pydantic import Field, model_validator
-from typing import Optional
+from pydantic import Field
+from pydantic_settings import SettingsConfigDict
 
-SECRETS_DIR = Path("/run/secrets")
+from trading_commons.config import BaseServiceSettings
 
 
-def _read_secret(name: str) -> Optional[str]:
-    """Read a Docker secret from /run/secrets/<name>."""
-    path = SECRETS_DIR / name
-    if path.is_file():
-        return path.read_text().strip()
-    return None
-
-
-class Settings(BaseSettings):
+class Settings(BaseServiceSettings):
     """Application settings loaded from Docker secrets or environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
     # Robinhood credentials
     robinhood_username: str = Field(..., description="Robinhood account username/email")
@@ -30,23 +33,16 @@ class Settings(BaseSettings):
         None, description="TOTP secret for 2FA (optional, for automated login)"
     )
 
-    @model_validator(mode="before")
-    @classmethod
-    def _load_docker_secrets(cls, values):
-        """Prefer Docker secrets over environment variables for credentials."""
-        secret_fields = [
-            "robinhood_username",
-            "robinhood_password",
-            "robinhood_totp_secret",
-        ]
-        for field in secret_fields:
-            secret_val = _read_secret(field)
-            if secret_val is not None:
-                values[field] = secret_val
-        return values
+    # Docker secrets scope — preserve the original behavior: ONLY the robinhood
+    # credentials are sourced from /run/secrets (not redis/telegram), so a
+    # mounted credential overrides the environment exactly as before.
+    SECRET_FIELDS: ClassVar[tuple[str, ...]] = (
+        "robinhood_username",
+        "robinhood_password",
+        "robinhood_totp_secret",
+    )
 
-    # Kafka configuration
-    kafka_brokers: str = Field("localhost:19092", description="Kafka broker addresses")
+    # Kafka configuration (kafka_brokers inherited; default localhost:19092)
     kafka_topic: str = Field("trading.orders", description="Kafka topic for trade events")
     kafka_positions_topic: str = Field(
         "trading.positions", description="Kafka topic for position snapshots"
@@ -55,11 +51,7 @@ class Settings(BaseSettings):
         "trading.watchlist", description="Kafka topic for watchlist events"
     )
 
-    # Redis configuration (for tracking synced orders)
-    redis_host: str = Field("localhost", description="Redis host")
-    redis_port: int = Field(6379, description="Redis port")
-    redis_password: Optional[str] = Field(None, description="Redis password (optional)")
-    redis_db: int = Field(0, description="Redis database number")
+    # Redis configuration (host/port/password/db inherited from the base)
     redis_synced_orders_key: str = Field(
         "robinhood:synced_orders", description="Redis key for synced order IDs set"
     )
@@ -79,36 +71,14 @@ class Settings(BaseSettings):
     market_open_hour: int = Field(4, description="Market open hour (ET) - pre-market starts")
     market_close_hour: int = Field(20, description="Market close hour (ET) - after-hours ends")
 
-    # Telegram alerts (optional — used to notify a human when the login
-    # retry loop halts on an unrecoverable auth failure).
-    telegram_bot_token: Optional[str] = Field(
-        None, description="Telegram bot token for halt alerts (optional)"
-    )
-    telegram_chat_id: Optional[str] = Field(
-        None, description="Telegram chat ID to receive halt alerts (optional)"
-    )
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    # Telegram alerts (telegram_bot_token / telegram_chat_id inherited from the
+    # base) — used to notify a human when the login retry loop halts on an
+    # unrecoverable auth failure.
 
     @property
     def watchlist_name_list(self) -> list[str]:
         """Return watchlist names as a list."""
         return [n.strip() for n in self.watchlist_names.split(",") if n.strip()]
-
-    @property
-    def kafka_broker_list(self) -> list[str]:
-        """Return Kafka brokers as a list."""
-        return [b.strip() for b in self.kafka_brokers.split(",")]
-
-    @property
-    def redis_url(self) -> str:
-        """Return Redis connection URL."""
-        if self.redis_password:
-            return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
-        return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
 
 def get_settings() -> Settings:

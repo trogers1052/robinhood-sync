@@ -1,9 +1,20 @@
-"""Prometheus metrics for robinhood-sync."""
+"""Prometheus metrics for robinhood-sync.
+
+Metric primitives (Counter/Gauge/Histogram) and the HTTP server come from the
+shared ``trading_commons.metrics`` shim, which transparently falls back to
+no-ops when prometheus_client is not installed. The service-specific metric
+definitions and the 9095 default port are preserved here unchanged.
+"""
 
 import logging
 import os
 
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from trading_commons.metrics import (
+    Counter,
+    Gauge,
+    Histogram,
+    start_metrics_server as _start_metrics_server,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +116,10 @@ LAST_SUCCESS = Gauge(
 
 
 def start_metrics_server() -> None:
-    """Start Prometheus metrics HTTP server on METRICS_PORT (default 9095)."""
+    """Start Prometheus metrics HTTP server on METRICS_PORT (default 9095).
+
+    Delegates to the shared ``trading_commons.metrics.start_metrics_server``,
+    preserving robinhood-sync's 9095 default when ``METRICS_PORT`` is unset.
+    """
     port = int(os.environ.get("METRICS_PORT", str(_DEFAULT_PORT)))
-    start_http_server(port)
-    logger.info(f"Metrics server listening on :{port}/metrics")
+    _start_metrics_server(port)

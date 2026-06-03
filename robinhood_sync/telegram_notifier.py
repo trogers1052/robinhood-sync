@@ -5,22 +5,25 @@ Used by the login retry loop to alert a human when the service halts
 on an unrecoverable auth failure (device-approval challenge or bad
 credentials). Designed to be a graceful no-op if Telegram creds are
 not configured, so unit tests and local runs don't blow up.
+
+This is now a thin wrapper over the shared
+``trading_commons.telegram.TelegramClient`` (httpx-based, with retry and a
+no-op-without-creds fallback). Behavior is preserved: messages are sent as
+plain text (``parse_mode=""``) to match the previous urllib-based notifier,
+``send()`` returns ``True``/``False`` and never raises, and a notifier with
+missing creds is a logged no-op.
 """
 
-import json
 import logging
-import urllib.error
-import urllib.parse
-import urllib.request
 from typing import Optional
+
+from trading_commons.telegram import TelegramClient
 
 logger = logging.getLogger(__name__)
 
 
 class TelegramNotifier:
-    """Post text messages to a Telegram chat via the Bot API."""
-
-    API_BASE = "https://api.telegram.org"
+    """Post text messages to a Telegram chat via the shared TelegramClient."""
 
     def __init__(
         self,
@@ -31,6 +34,11 @@ class TelegramNotifier:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.timeout = timeout_seconds
+        self._client = TelegramClient(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            timeout=timeout_seconds,
+        )
 
     @property
     def enabled(self) -> bool:
@@ -41,37 +49,13 @@ class TelegramNotifier:
         POST a message to the configured chat. Returns True on success,
         False on any failure (creds missing, network error, non-200).
         Never raises — the notifier is a best-effort side channel.
+
+        Messages are sent as plain text (no parse mode) to preserve the
+        original notifier's behavior.
         """
         if not self.enabled:
             logger.info("Telegram notifier disabled (no creds); skipping alert")
             return False
-
-        url = f"{self.API_BASE}/bot{self.bot_token}/sendMessage"
-        payload = urllib.parse.urlencode(
-            {"chat_id": self.chat_id, "text": text}
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-                if resp.status != 200:
-                    logger.error(
-                        f"Telegram returned status={resp.status} body={body[:200]}"
-                    )
-                    return False
-                parsed = json.loads(body) if body else {}
-                if not parsed.get("ok", False):
-                    logger.error(f"Telegram API not-ok: {body[:200]}")
-                    return False
-                return True
-        except urllib.error.URLError as e:
-            logger.error(f"Telegram send failed: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error sending Telegram message: {e}")
-            return False
+        # parse_mode="" => Telegram treats the message as plain text, matching
+        # the prior urllib-based notifier exactly.
+        return self._client.send_message(text, parse_mode="")
