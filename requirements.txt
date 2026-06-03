@@ -29,3 +29,7 @@ prometheus-client==0.24.1
 # Testing
 pytest==9.0.2
 pytest-mock==3.15.1
+
+# Event contract schemas (test-only: validates emitted Kafka payloads against
+# the platform's single source of truth for Kafka event contracts)
+trading-event-schemas @ git+https://github.com/trogers1052/trading-event-schemas@v0.1.0
