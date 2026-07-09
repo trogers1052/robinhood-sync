@@ -14,7 +14,7 @@ redis==7.0.1
 
 # Configuration
 python-dotenv==1.2.2
-pydantic==2.12.5
+pydantic==2.13.2
 pydantic-settings==2.13.1
 
 # Date handling
