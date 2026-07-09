@@ -27,7 +27,7 @@ pyotp==2.9.0
 prometheus-client==0.24.1
 
 # Testing
-pytest==9.0.2
+pytest==9.0.3
 pytest-mock==3.15.1
 
 # Event contract schemas (test-only: validates emitted Kafka payloads against
