@@ -7,7 +7,7 @@ trading-py-commons @ git+https://github.com/trogers1052/trading-py-commons.git@v
 robin-stocks==3.4.0
 
 # Kafka
-kafka-python==2.3.0
+kafka-python==2.3.1
 
 # Redis (for tracking synced orders)
 redis==7.0.1
