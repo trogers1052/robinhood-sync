@@ -1,109 +1,37 @@
 """
 Robinhood API client wrapper using robin_stocks library.
+
+Authentication is *not* delegated to ``rh.login()``. It lives in
+:mod:`robinhood_sync.session`, which resumes a persisted session and refreshes
+it with the OAuth refresh token, falling back to a password login only when
+there is nothing left to resume. See that module's docstring for why.
 """
 
-import io
 import logging
 import time
 from collections import OrderedDict
-from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from enum import Enum
 from typing import Optional
 
 import robin_stocks.robinhood as rh
 from dateutil import parser as date_parser
 
 # Importing auth_patch installs a 429-aware replacement for robin_stocks's
-# _validate_sherrif_id BEFORE any login() call runs. Must precede any code
-# that touches rh.login.
+# _validate_sherrif_id BEFORE any login runs.
 from . import auth_patch  # noqa: F401 — import for side effect
 from .metrics import API_CALLS, API_DURATION, API_ERRORS
+from .session import (  # noqa: F401 — LoginOutcome re-exported for callers
+    LoginOutcome,
+    SessionManager,
+    classify_login_failure,
+)
 
 logger = logging.getLogger(__name__)
 
-
-class LoginOutcome(str, Enum):
-    """
-    Classified result of an attempted Robinhood login.
-
-    The retry loop in main.py uses this to decide whether to back off,
-    halt and alert, or treat the failure as transient.
-    """
-
-    SUCCESS = "success"
-    # Network/DNS/5xx — safe to retry with backoff
-    TRANSIENT = "transient"
-    # HTTP 429 from get_prompts_status — must wait hours, not minutes
-    RATE_LIMITED = "rate_limited"
-    # Robinhood demands a device approval push on the user's phone.
-    # The Pi cannot complete this; halt and alert a human.
-    DEVICE_CHALLENGE = "device_challenge"
-    # rh.login() returned falsy with no challenge signal — likely creds.
-    BAD_CREDENTIALS = "bad_credentials"
-    # Anything else we couldn't classify confidently.
-    UNKNOWN = "unknown"
-
-    @property
-    def is_halt(self) -> bool:
-        """True if this outcome requires human intervention (no retry)."""
-        return self in (LoginOutcome.DEVICE_CHALLENGE, LoginOutcome.BAD_CREDENTIALS)
-
-
-def _classify_login_failure(stdout: str, exception: Optional[BaseException]) -> LoginOutcome:
-    """
-    Inspect robin_stocks's stdout and the raised exception (if any) to
-    classify a failed login attempt.
-
-    robin_stocks prints challenge state to stdout rather than raising,
-    so we capture stdout to read it. The 429 path inside its
-    `_validate_sherrif_id` typically crashes with
-    `TypeError: 'NoneType' object is not subscriptable` when it tries to
-    parse the rate-limited response as JSON.
-    """
-    stdout_lower = stdout.lower()
-    exc_str = (str(exception) or "").lower() if exception else ""
-    exc_type = type(exception).__name__ if exception else ""
-
-    # Rate-limited — most urgent classification, must dominate over device-challenge
-    # because a 429 *is* a device-challenge polling response, but treating it as
-    # "challenge required" leads to more retries which makes the 429 worse.
-    if "429" in stdout or "too many requests" in stdout_lower:
-        return LoginOutcome.RATE_LIMITED
-    if "'nonetype' object is not subscriptable" in exc_str or \
-       "'nonetype' object is not subscriptable" in stdout_lower:
-        return LoginOutcome.RATE_LIMITED
-
-    # Device-approval challenge was demanded (regardless of whether it timed out
-    # or the user approved late).
-    challenge_markers = (
-        "verification required",
-        "verification_workflow",
-        "device approvals",
-        "approve the login request",
-        "starting verification process",
-    )
-    if any(m in stdout_lower for m in challenge_markers):
-        return LoginOutcome.DEVICE_CHALLENGE
-    if exc_type in ("TimeoutError",) and "verification" in exc_str:
-        return LoginOutcome.DEVICE_CHALLENGE
-    if "challenge_status" in exc_str or "'status'" in exc_str:
-        return LoginOutcome.DEVICE_CHALLENGE
-
-    # Bad creds — robin_stocks prints this when the username/password is rejected
-    # without a challenge being issued.
-    if "check credentials" in stdout_lower or "incorrect login" in stdout_lower:
-        return LoginOutcome.BAD_CREDENTIALS
-
-    # Network-ish exceptions or unrecognized failure — safe to retry transiently.
-    transient_markers = ("connection", "timeout", "temporarily unavailable", "dns",
-                         "name or service not known", "max retries exceeded")
-    if any(m in exc_str for m in transient_markers):
-        return LoginOutcome.TRANSIENT
-
-    return LoginOutcome.UNKNOWN
+# Back-compat alias: the classifier moved to session.py alongside LoginOutcome.
+_classify_login_failure = classify_login_failure
 
 
 @dataclass
@@ -248,10 +176,17 @@ class RobinhoodClient:
         username: str,
         password: str,
         totp_secret: Optional[str] = None,
+        session_manager: Optional[SessionManager] = None,
     ):
         self.username = username
         self.password = password
         self.totp_secret = totp_secret
+        # Without an injected manager (tests, ad-hoc scripts) the session is
+        # file-mirrored only; the service passes one built from Settings so the
+        # bundle also lands in Redis.
+        self.session = session_manager or SessionManager(
+            username=username, password=password, totp_secret=totp_secret
+        )
         self._logged_in = False
         self._last_login_outcome: LoginOutcome = LoginOutcome.UNKNOWN
         self._instrument_cache: OrderedDict[str, str] = OrderedDict()  # URL -> symbol
@@ -296,75 +231,56 @@ class RobinhoodClient:
         """
         Authenticate with Robinhood and classify the result.
 
+        Delegates to :class:`~robinhood_sync.session.SessionManager`, which
+        prefers resuming/refreshing the persisted session over a password
+        login. A password login is the only path that can raise a device
+        challenge, so on a healthy service this call never issues one.
+
         Returns:
             LoginOutcome — SUCCESS on success, or one of the failure
             classifications (DEVICE_CHALLENGE, RATE_LIMITED, BAD_CREDENTIALS,
             TRANSIENT, UNKNOWN). Callers should use `LoginOutcome.is_halt`
             to decide whether to retry or surface to a human.
-
-        The previous bool-returning signature is preserved at the call sites
-        via the truthiness of SUCCESS (kept distinct here so we can route
-        retries intelligently in main.py).
         """
-        logger.info(f"Logging in to Robinhood as {self.username}...")
+        logger.info(f"Authenticating with Robinhood as {self.username}...")
 
-        # Generate TOTP code if secret provided
-        mfa_code = None
         try:
-            if self.totp_secret:
-                import pyotp
-                totp = pyotp.TOTP(self.totp_secret)
-                mfa_code = totp.now()
-                logger.info("Generated TOTP code for 2FA")
-        except Exception as e:
-            logger.error(f"Error generating TOTP code: {e}")
-            return LoginOutcome.UNKNOWN
+            outcome = self.session.authenticate()
+        except BaseException as exc:  # noqa: BLE001 — classify, never crash init
+            outcome = classify_login_failure("", exc)
+            logger.error(f"Authentication raised: outcome={outcome.value} exc={exc!r}")
 
-        # robin_stocks prints challenge state to stdout (not via logging) and
-        # swallows certain errors internally. Capture stdout so we can classify
-        # the failure mode after the fact.
-        captured = io.StringIO()
-        login_exc: Optional[BaseException] = None
-        login_result = None
-        try:
-            with redirect_stdout(captured):
-                # store_session=True is required — robin_stocks persists the
-                # device-approval token so headless restarts don't re-trigger
-                # Robinhood's interactive device approval flow.
-                login_result = rh.login(
-                    username=self.username,
-                    password=self.password,
-                    mfa_code=mfa_code,
-                    store_session=True,
-                )
-        except BaseException as exc:  # noqa: BLE001 — we classify below
-            login_exc = exc
-
-        stdout = captured.getvalue()
-        if stdout.strip():
-            # Echo robin_stocks's output through our logger so it shows up in
-            # `docker logs` alongside our own messages.
-            for line in stdout.strip().splitlines():
-                logger.info(f"robin_stocks: {line}")
-
-        if login_result and not login_exc:
-            self._logged_in = True
-            self._last_login_outcome = LoginOutcome.SUCCESS
-            logger.info("Successfully logged in to Robinhood")
-            return LoginOutcome.SUCCESS
-
-        outcome = _classify_login_failure(stdout, login_exc)
         self._last_login_outcome = outcome
-        if login_exc:
-            logger.error(f"Login failed: outcome={outcome.value} exc={login_exc!r}")
+        self._logged_in = outcome == LoginOutcome.SUCCESS
+        if self._logged_in:
+            logger.info("Successfully authenticated with Robinhood")
         else:
-            logger.error(f"Login failed: outcome={outcome.value}")
+            logger.error(f"Authentication failed: outcome={outcome.value}")
         return outcome
 
-    def logout(self) -> None:
-        """Logout from Robinhood."""
+    def ensure_session(self) -> bool:
+        """
+        Keep the access token ahead of its expiry.
+
+        Called before each sync cycle. Refreshes only when the token is past
+        half its life, so the steady-state cost is a comparison, not a request.
+        """
+        if not self._logged_in:
+            return False
         try:
-            rh.logout()
+            fresh = self.session.ensure_fresh()
+        except Exception as e:  # noqa: BLE001 — a refresh failure is not fatal here
+            logger.warning(f"Session freshness check failed: {e}")
+            return True
+        if not fresh:
+            self._logged_in = False
+            self._last_login_outcome = self.session.last_outcome
+        return fresh
+
+    def logout(self) -> None:
+        """Logout from Robinhood (in-process only; the persisted session stays)."""
+        try:
+            self.session.logout()
             self._logged_in = False
             logger.info("Logged out from Robinhood")
         except Exception as e:

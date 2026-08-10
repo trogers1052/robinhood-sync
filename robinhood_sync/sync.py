@@ -10,6 +10,7 @@ from .config import Settings
 from .robinhood_client import LoginOutcome, RobinhoodClient, Trade
 from .kafka_producer import TradeEventProducer
 from .redis_client import SyncedOrdersTracker, PositionStore, WatchlistStore, StopOrderStore, EarningsCalendarStore
+from .session import SessionManager
 from .metrics import (
     TRADES_SYNCED,
     TRADES_SKIPPED,
@@ -46,11 +47,14 @@ class TradeSyncService:
         Returns:
             True if all connections successful, False otherwise.
         """
-        # Initialize Robinhood client
+        # Initialize Robinhood client. The session manager persists the OAuth
+        # bundle to Redis + a file mirror and refreshes it before expiry, so a
+        # restart resumes rather than re-logging-in.
         self.robinhood = RobinhoodClient(
             username=self.settings.robinhood_username,
             password=self.settings.robinhood_password,
             totp_secret=self.settings.robinhood_totp_secret,
+            session_manager=SessionManager.from_settings(self.settings),
         )
 
         if self.robinhood.login() != LoginOutcome.SUCCESS:
@@ -496,6 +500,7 @@ class TradeSyncService:
         """Clean up connections."""
         if self.robinhood:
             self.robinhood.logout()
+            self.robinhood.session.close()
 
         if self.kafka:
             self.kafka.close()
@@ -516,6 +521,18 @@ class TradeSyncService:
             self.earnings_store.close()
 
         logger.info("All connections closed")
+
+    def ensure_session(self) -> bool:
+        """
+        Refresh the Robinhood access token if it is past half its life.
+
+        Called before each sync cycle. This is what keeps the service off the
+        password-login path: the token is renewed with the refresh grant long
+        before Robinhood expires it.
+        """
+        if not self.robinhood:
+            return False
+        return self.robinhood.ensure_session()
 
     def is_healthy(self) -> bool:
         """

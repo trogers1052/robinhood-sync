@@ -10,6 +10,7 @@ Automatically syncs your Robinhood trades to Kafka for processing by other servi
 - Also syncs positions, account balance, stop orders, watchlist, and the earnings calendar to Redis/Kafka
 - Supports 2FA with TOTP
 - Supports Docker secrets for credentials (`/run/secrets/`)
+- **Durable authentication** — the OAuth session is persisted (Redis + file mirror) and renewed with the refresh token, so restarts resume instead of re-logging-in ([details](#authentication))
 - Runs continuously with a configurable, market-hours-aware polling interval
 - Or run once for an initial historical sync
 
@@ -54,6 +55,13 @@ Configuration is loaded via `pydantic-settings` from environment variables (or a
 | `ROBINHOOD_USERNAME` | Your Robinhood email | **Required** |
 | `ROBINHOOD_PASSWORD` | Your Robinhood password | **Required** |
 | `ROBINHOOD_TOTP_SECRET` | TOTP secret for 2FA | Optional |
+| `ROBINHOOD_DEVICE_TOKEN` | Pinned device identity (see [Authentication](#authentication)) | Auto-generated |
+| `SESSION_REDIS_ENABLED` | Persist the session to Redis as well as the file mirror | `true` |
+| `REDIS_SESSION_KEY` | Redis key holding the session document | `robinhood:session` |
+| `ROBINHOOD_SESSION_FILE` | Local mirror of the session document | `~/.tokens/robinhood_session.json` |
+| `SESSION_EXPIRES_IN` | Access token lifetime to request (seconds) | `86400` |
+| `SESSION_REFRESH_RATIO` | Refresh once this fraction of the token's life has elapsed | `0.5` |
+| `SESSION_REFRESH_MARGIN_SEC` | Always refresh with fewer than this many seconds left | `900` |
 | `KAFKA_BROKERS` | Kafka broker addresses | `localhost:19092` |
 | `KAFKA_TOPIC` | Topic for trade events | `trading.orders` |
 | `KAFKA_POSITIONS_TOPIC` | Topic for position snapshots | `trading.positions` |
@@ -70,6 +78,64 @@ Configuration is loaded via `pydantic-settings` from environment variables (or a
 | `MARKET_CLOSE_HOUR` | Market close hour, ET (after-hours end) | `20` |
 | `TELEGRAM_BOT_TOKEN` | Bot token for halt alerts | Optional |
 | `TELEGRAM_CHAT_ID` | Chat ID for halt alerts | Optional |
+
+## Authentication
+
+Authentication does **not** go through `rh.login()`. It lives in
+`robinhood_sync/session.py`, because robin_stocks' own session handling loses
+the login in three ways that cost this service two multi-week outages:
+
+1. it stores the OAuth `refresh_token` but never uses it, so an expired access
+   token falls straight back to a full password login;
+2. a password login mints a **new random `device_token`** whenever its pickle
+   can't be read — Robinhood sees an unknown device and issues an approval
+   challenge that a headless service cannot answer;
+3. the pickle is the only copy of the session, in a container volume, and is
+   rewritten (`open(..., 'wb')`) on every attempt.
+
+### How it works now
+
+```
+persisted session (Redis + file mirror)
+        │
+        ├─ resume ─────────────► valid?          ─► done (no network login)
+        │                          │ no
+        ├─ refresh_token grant ────┘              ─► done (rotated token persisted)
+        │        │ rejected / no session
+        └─ password login ────────────────────────► may raise a device challenge
+```
+
+The access token is refreshed at **half its life** (before each sync cycle and
+at startup), so the password login is effectively never reached. The
+`device_token` is pinned and persisted separately from the tokens, so even a
+wiped store still presents the same trusted device.
+
+A 429 never escalates to a password login — rate-limiting is treated as
+"back off", not "re-authenticate". That is the guard against the restart-loop
+that previously issued 205 login attempts in a row.
+
+### Priming a session (the one interactive step)
+
+Run this from a machine where you can approve the prompt or type an SMS code —
+never on the headless host:
+
+```bash
+REDIS_HOST=<pi-host> REDIS_PASSWORD=... python -m robinhood_sync.prime_session
+```
+
+It logs in interactively, then writes the session (and device token) straight
+into the Redis the service reads. Useful flags:
+
+| Flag | Purpose |
+|------|---------|
+| `--reuse` | Resume/refresh the persisted session instead of logging in, if possible |
+| `--force` | Always do a full password login |
+| `--no-redis` | Write only the local file mirror |
+| `--device-token TOKEN` | Pin a specific device identity |
+| `--import-pickle PATH` | Adopt an existing robin_stocks pickle (migration) |
+
+Record the device token it prints as a Docker secret
+(`/run/secrets/robinhood_device_token`) so it survives even a wiped store.
 
 ## Trade Event Schema
 
@@ -188,11 +254,30 @@ If you have 2FA enabled, you need to provide the TOTP secret:
 3. Copy the secret key shown during setup
 4. Set `ROBINHOOD_TOTP_SECRET` in your `.env`
 
-### "Challenge required" error
-Robinhood may require additional verification:
-1. Check your email for a verification code
-2. Try logging in manually first via browser
-3. Run the service with `--debug` for more details
+### "Challenge required" / `outcome=device_challenge`
+The persisted session could not be resumed or refreshed, so the service fell
+back to a password login and Robinhood challenged it. A headless host cannot
+answer that, so the service **halts** rather than retry-looping (retrying is
+what earns a rate-limit block).
+
+Re-prime from a machine with a human present:
+
+```bash
+REDIS_HOST=<pi-host> REDIS_PASSWORD=... python -m robinhood_sync.prime_session
+# approve the prompt on your phone, then restart the service
+```
+
+If this recurs often, check that `ROBINHOOD_DEVICE_TOKEN` is pinned and that
+Redis is actually reachable from the service — a session that can't be
+persisted has to be re-minted every restart.
+
+### Session isn't surviving restarts
+- `redis-cli GET robinhood:session` should return a document with a
+  `refresh_token` and a `device_token`.
+- The file mirror (`ROBINHOOD_SESSION_FILE`) must live on a mounted volume;
+  the default `~/.tokens/` is volume-backed in the shipped compose.
+- Look for `Resumed persisted Robinhood session` in the logs at startup. If you
+  see `Password login to Robinhood as ...` instead, the store was empty.
 
 ### Orders not appearing
 - Make sure orders are in "filled" state

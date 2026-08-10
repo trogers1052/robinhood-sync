@@ -137,10 +137,13 @@ def _halt_with_alert(
     if outcome == LoginOutcome.DEVICE_CHALLENGE:
         title = "Robinhood device approval required"
         action = (
-            "Prime a fresh session pickle from your laptop "
-            "(interactive login + tap Approve on phone), then "
-            "scp it to the Pi's robinhood_session volume and "
-            "run `docker start projects-robinhood-sync-1`."
+            "The persisted session could not be resumed or refreshed, so a "
+            "password login was attempted and Robinhood challenged it. "
+            "Re-prime from your Mac:\n"
+            "  cd ~/Projects/trading-platform/robinhood-sync\n"
+            "  REDIS_HOST=<pi-host> python -m robinhood_sync.prime_session\n"
+            "Approve the prompt on your phone, then "
+            "`docker start projects-robinhood-sync-1`."
         )
     elif outcome == LoginOutcome.BAD_CREDENTIALS:
         title = "Robinhood login rejected (bad credentials?)"
@@ -389,6 +392,13 @@ def run_continuous(settings: Settings, since_days: Optional[int] = None) -> int:
             if not scheduler.is_market_hours():
                 logger.debug("Woke up outside market hours, recalculating sleep...")
                 continue
+
+            # Keep the access token ahead of its expiry. Cheap no-op unless the
+            # token is past half its life; doing it here means the password
+            # login path (the only one that can raise a device challenge) is
+            # never reached in steady state.
+            if not service.ensure_session():
+                logger.warning("Session could not be refreshed — reconnecting")
 
             # Health check before sync
             if not service.is_healthy():

@@ -197,3 +197,105 @@ def test_finalization_eventual_success(stub_post, stub_get):
     ]
     # No raise.
     auth_patch.patched_validate_sherrif_id("dev-tok", "wf-1")
+
+
+# ---------------------------------------------------------------------------
+# interactive code challenges (prime_session only — never on the Pi)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_code_provider():
+    """The provider is module-global; a leak would un-headless the Pi path."""
+    yield
+    auth_patch.set_code_provider(None)
+
+
+def _sms_challenge(status="issued"):
+    return {
+        "context": {
+            "sheriff_challenge": {
+                "type": "sms",
+                "id": "challenge-1",
+                "status": status,
+            }
+        }
+    }
+
+
+def test_sms_challenge_raises_without_a_code_provider(stub_post, stub_get):
+    """Headless default: no provider means halt, not block on input()."""
+    stub_get.return_value = _sms_challenge()
+    with pytest.raises(RuntimeError, match="requires interactive input"):
+        auth_patch.patched_validate_sherrif_id("dev-tok", "wf-1")
+
+
+def test_sms_challenge_answered_by_code_provider(stub_post, stub_get):
+    stub_get.return_value = _sms_challenge()
+    stub_post.side_effect = [
+        {"id": "machine-123"},                                  # pathfinder
+        {"status": "validated"},                                # challenge respond
+        {"type_context": {"result": "workflow_status_approved"}},  # finalize
+    ]
+    auth_patch.set_code_provider(lambda challenge_type: "123456")
+
+    assert auth_patch.patched_validate_sherrif_id("dev-tok", "wf-1") is None
+
+    respond_call = stub_post.call_args_list[1]
+    assert respond_call.kwargs["payload"] == {"response": "123456"}
+    assert "challenge-1" in respond_call.kwargs["url"]
+
+
+def test_code_provider_receives_the_challenge_type(stub_post, stub_get):
+    stub_get.return_value = _sms_challenge()
+    stub_post.side_effect = [
+        {"id": "machine-123"},
+        {"status": "validated"},
+        {"type_context": {"result": "workflow_status_approved"}},
+    ]
+    seen = []
+    auth_patch.set_code_provider(lambda challenge_type: seen.append(challenge_type) or "1")
+    auth_patch.patched_validate_sherrif_id("dev-tok", "wf-1")
+    assert seen == ["sms"]
+
+
+def test_rejected_code_falls_through_to_the_headless_error(stub_post, stub_get):
+    stub_get.return_value = _sms_challenge()
+    stub_post.side_effect = [
+        {"id": "machine-123"},
+        {"status": "rejected"},
+    ]
+    auth_patch.set_code_provider(lambda challenge_type: "000000")
+    with pytest.raises(RuntimeError, match="requires interactive input"):
+        auth_patch.patched_validate_sherrif_id("dev-tok", "wf-1")
+
+
+def test_empty_code_is_treated_as_no_answer(stub_post, stub_get):
+    stub_get.return_value = _sms_challenge()
+    auth_patch.set_code_provider(lambda challenge_type: "")
+    with pytest.raises(RuntimeError, match="requires interactive input"):
+        auth_patch.patched_validate_sherrif_id("dev-tok", "wf-1")
+
+
+def test_aborted_code_entry_is_treated_as_no_answer(stub_post, stub_get):
+    stub_get.return_value = _sms_challenge()
+
+    def _abort(_challenge_type):
+        raise KeyboardInterrupt
+
+    auth_patch.set_code_provider(_abort)
+    with pytest.raises(RuntimeError, match="requires interactive input"):
+        auth_patch.patched_validate_sherrif_id("dev-tok", "wf-1")
+
+
+def test_email_challenge_uses_the_same_path(stub_post, stub_get):
+    challenge = _sms_challenge()
+    challenge["context"]["sheriff_challenge"]["type"] = "email"
+    stub_get.return_value = challenge
+    stub_post.side_effect = [
+        {"id": "machine-123"},
+        {"status": "validated"},
+        {"type_context": {"result": "workflow_status_approved"}},
+    ]
+    auth_patch.set_code_provider(lambda challenge_type: "654321")
+    assert auth_patch.patched_validate_sherrif_id("dev-tok", "wf-1") is None

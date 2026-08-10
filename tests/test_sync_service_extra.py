@@ -26,7 +26,16 @@ def mock_settings():
     s.redis_password = None
     s.redis_db = 0
     s.redis_synced_orders_key = "test:synced"
+    s.redis_session_key = "test:session"
     s.watchlist_name_list = ["Materials"]
+    # Session persistence: file-mirror only, in a path tests never write to
+    # (initialize() is always run with RobinhoodClient patched out).
+    s.session_redis_enabled = False
+    s.robinhood_session_file = "/tmp/robinhood-sync-test-session.json"
+    s.robinhood_device_token = "test-device-token"
+    s.session_expires_in = 86400
+    s.session_refresh_ratio = 0.5
+    s.session_refresh_margin_sec = 900
     return s
 
 
