@@ -57,10 +57,23 @@ class TestIsLoggedIn:
 
 
 class TestLogin:
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_success(self, mock_rh):
-        mock_rh.login.return_value = {"access_token": "abc"}
-        c = RobinhoodClient("user", "pass")
+    """
+    login() is now a thin wrapper over SessionManager.authenticate().
+
+    The authentication mechanics (resume / refresh / password fallback) are
+    covered in test_session.py; these tests pin the wrapper's contract.
+    """
+
+    @staticmethod
+    def _client(outcome=None, **kwargs):
+        manager = Mock()
+        if outcome is not None:
+            manager.authenticate.return_value = outcome
+            manager.last_outcome = outcome
+        return RobinhoodClient("user", "pass", session_manager=manager, **kwargs)
+
+    def test_login_success(self):
+        c = self._client(LoginOutcome.SUCCESS)
         result = c.login()
         assert result == LoginOutcome.SUCCESS
         assert c.last_login_outcome == LoginOutcome.SUCCESS
@@ -68,93 +81,84 @@ class TestLogin:
         # Credentials preserved for reconnection
         assert c.password == "pass"
 
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_returns_none_classifies_unknown(self, mock_rh):
-        """rh.login() returning None with no challenge signal → UNKNOWN."""
-        mock_rh.login.return_value = None
-        c = RobinhoodClient("user", "pass")
-        result = c.login()
-        assert result == LoginOutcome.UNKNOWN
+    def test_login_delegates_to_session_manager(self):
+        c = self._client(LoginOutcome.SUCCESS)
+        c.login()
+        c.session.authenticate.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            LoginOutcome.UNKNOWN,
+            LoginOutcome.TRANSIENT,
+            LoginOutcome.RATE_LIMITED,
+            LoginOutcome.DEVICE_CHALLENGE,
+            LoginOutcome.BAD_CREDENTIALS,
+        ],
+    )
+    def test_login_failure_outcomes_propagate(self, outcome):
+        c = self._client(outcome)
+        assert c.login() == outcome
+        assert c.last_login_outcome == outcome
         assert c._logged_in is False
 
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_network_exception_classifies_transient(self, mock_rh):
-        mock_rh.login.side_effect = Exception("Connection refused")
-        c = RobinhoodClient("user", "pass")
-        result = c.login()
-        assert result == LoginOutcome.TRANSIENT
-        assert c.last_login_outcome == LoginOutcome.TRANSIENT
+    def test_login_classifies_raised_exception(self):
+        """A manager that raises must not crash init — it gets classified."""
+        manager = Mock()
+        manager.authenticate.side_effect = ConnectionError("Connection refused")
+        c = RobinhoodClient("user", "pass", session_manager=manager)
+        assert c.login() == LoginOutcome.TRANSIENT
+        assert c._logged_in is False
 
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_429_classifies_rate_limited(self, mock_rh):
-        """robin_stocks's 429 path crashes with NoneType subscript inside its own try."""
-        def _fake_login(**kwargs):
-            print("Starting login process...")
-            print("Verification required, handling challenge...")
-            print("Starting verification process...")
-            print("Check robinhood app for device approvals method...")
-            print("429 Client Error: Too Many Requests for url: ...")
-            return None
-        mock_rh.login.side_effect = _fake_login
-        c = RobinhoodClient("user", "pass")
-        result = c.login()
-        assert result == LoginOutcome.RATE_LIMITED
-        assert result.is_halt is False  # rate-limited still retryable after long cooldown
+    def test_login_classifies_raised_rate_limit(self):
+        manager = Mock()
+        manager.authenticate.side_effect = TypeError(
+            "'NoneType' object is not subscriptable"
+        )
+        c = RobinhoodClient("user", "pass", session_manager=manager)
+        assert c.login() == LoginOutcome.RATE_LIMITED
 
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_nonetype_subscript_classifies_rate_limited(self, mock_rh):
-        """The exact TypeError pattern from robin_stocks's _validate_sherrif_id on 429."""
-        mock_rh.login.side_effect = TypeError("'NoneType' object is not subscriptable")
-        c = RobinhoodClient("user", "pass")
-        result = c.login()
-        assert result == LoginOutcome.RATE_LIMITED
-
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_device_challenge_classified(self, mock_rh):
-        """Verification workflow detected → halt for human approval."""
-        def _fake_login(**kwargs):
-            print("Starting login process...")
-            print("Verification required, handling challenge...")
-            print("Starting verification process...")
-            print("Check robinhood app for device approvals method...")
-            return None
-        mock_rh.login.side_effect = _fake_login
-        c = RobinhoodClient("user", "pass")
-        result = c.login()
-        assert result == LoginOutcome.DEVICE_CHALLENGE
-        assert result.is_halt is True
-
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_bad_credentials_classified(self, mock_rh):
-        def _fake_login(**kwargs):
-            print("Login failed. Check credentials and try again.")
-            return None
-        mock_rh.login.side_effect = _fake_login
-        c = RobinhoodClient("user", "pass")
-        result = c.login()
-        assert result == LoginOutcome.BAD_CREDENTIALS
-        assert result.is_halt is True
-
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_login_with_totp(self, mock_rh):
-        """Login with TOTP generates mfa_code and passes it to rh.login."""
-        mock_rh.login.return_value = {"access_token": "abc"}
+    def test_default_session_manager_carries_credentials(self):
+        """Constructed without a manager, the client still builds a usable one."""
         c = RobinhoodClient("user", "pass", totp_secret="JBSWY3DPEHPK3PXP")
+        assert c.session.username == "user"
+        assert c.session.password == "pass"
+        assert c.session.totp_secret == "JBSWY3DPEHPK3PXP"
 
-        # pyotp is imported inside login(), so we patch it at the module level
-        import sys
-        mock_pyotp = Mock()
-        mock_totp_obj = Mock()
-        mock_totp_obj.now.return_value = "123456"
-        mock_pyotp.TOTP.return_value = mock_totp_obj
 
-        with patch.dict(sys.modules, {"pyotp": mock_pyotp}):
-            result = c.login()
+class TestEnsureSession:
+    def test_noop_when_not_logged_in(self):
+        manager = Mock()
+        c = RobinhoodClient("user", "pass", session_manager=manager)
+        assert c.ensure_session() is False
+        manager.ensure_fresh.assert_not_called()
 
-        assert result == LoginOutcome.SUCCESS
-        # Verify TOTP code was passed
-        _, kwargs = mock_rh.login.call_args
-        assert kwargs["mfa_code"] == "123456"
+    def test_delegates_when_logged_in(self):
+        manager = Mock()
+        manager.ensure_fresh.return_value = True
+        c = RobinhoodClient("user", "pass", session_manager=manager)
+        c._logged_in = True
+        assert c.ensure_session() is True
+        manager.ensure_fresh.assert_called_once_with()
+
+    def test_marks_logged_out_when_refresh_fails(self):
+        manager = Mock()
+        manager.ensure_fresh.return_value = False
+        manager.last_outcome = LoginOutcome.DEVICE_CHALLENGE
+        c = RobinhoodClient("user", "pass", session_manager=manager)
+        c._logged_in = True
+        assert c.ensure_session() is False
+        assert c.is_logged_in() is False
+        assert c.last_login_outcome == LoginOutcome.DEVICE_CHALLENGE
+
+    def test_refresh_exception_is_not_fatal(self):
+        """A failed freshness check must not tear down a working session."""
+        manager = Mock()
+        manager.ensure_fresh.side_effect = RuntimeError("redis down")
+        c = RobinhoodClient("user", "pass", session_manager=manager)
+        c._logged_in = True
+        assert c.ensure_session() is True
+        assert c.is_logged_in() is True
 
 
 class TestClassifier:
@@ -202,20 +206,23 @@ class TestClassifier:
 
 
 class TestLogout:
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_logout(self, mock_rh):
-        c = RobinhoodClient("user", "pass")
+    def test_logout(self):
+        manager = Mock()
+        c = RobinhoodClient("user", "pass", session_manager=manager)
         c._logged_in = True
         c.logout()
         assert c._logged_in is False
-        mock_rh.logout.assert_called_once()
+        manager.logout.assert_called_once()
 
-    @patch("robinhood_sync.robinhood_client.rh")
-    def test_logout_exception(self, mock_rh):
-        mock_rh.logout.side_effect = Exception("error")
-        c = RobinhoodClient("user", "pass")
+    def test_logout_exception(self):
+        manager = Mock()
+        manager.logout.side_effect = Exception("error")
+        c = RobinhoodClient("user", "pass", session_manager=manager)
         c._logged_in = True
-        c.logout()  # Should not raise
+        c.logout()
+        # Swallowed: a failed logout must not break shutdown.
+        assert c._logged_in is True
+
 
 
 # ---------------------------------------------------------------------------

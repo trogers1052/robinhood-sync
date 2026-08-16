@@ -38,6 +38,7 @@ imports it at module load time, so any code path that goes through
 
 import logging
 import time
+from typing import Callable, Optional
 
 import robin_stocks.robinhood.authentication as _rs_auth
 from robin_stocks.robinhood.helper import request_get, request_post
@@ -52,6 +53,51 @@ INITIAL_POLL_INTERVAL_SEC = 5.0      # match upstream when things are normal
 RATE_LIMIT_BACKOFF_MIN_SEC = 30.0    # first backoff step when we see a 429-shaped failure
 RATE_LIMIT_BACKOFF_MAX_SEC = 120.0   # never sleep longer than this between polls
 FINALIZATION_RETRY_ATTEMPTS = 5
+
+CHALLENGE_RESPOND_URL = "https://api.robinhood.com/challenge/{challenge_id}/respond/"
+
+# Optional interactive code source, installed only by `prime_session` when a
+# human is present. On the Pi this stays None and SMS/email challenges raise,
+# which the wrapper classifies as DEVICE_CHALLENGE → halt.
+_code_provider: Optional[Callable[[str], str]] = None
+
+
+def set_code_provider(provider: Optional[Callable[[str], str]]) -> None:
+    """
+    Install (or clear) the callable that supplies SMS/email challenge codes.
+
+    Passing None restores headless behavior. The default is None so that
+    nothing running unattended can ever block on input().
+    """
+    global _code_provider
+    _code_provider = provider
+
+
+def _respond_to_code_challenge(challenge_type: str, challenge_id: str) -> bool:
+    """
+    Answer an SMS/email challenge using the installed code provider.
+
+    Returns True if Robinhood validated the code. Returns False if there is no
+    provider (caller raises) or the code was rejected.
+    """
+    if _code_provider is None:
+        return False
+    try:
+        code = _code_provider(challenge_type)
+    except (EOFError, KeyboardInterrupt) as e:
+        print(f"auth_patch: code entry aborted ({type(e).__name__})")
+        return False
+    if not code:
+        return False
+    response = request_post(
+        url=CHALLENGE_RESPOND_URL.format(challenge_id=challenge_id),
+        payload={"response": code},
+    )
+    if isinstance(response, dict) and response.get("status") == "validated":
+        print("auth_patch: challenge code validated.")
+        return True
+    print(f"auth_patch: challenge code rejected (response={response!r})")
+    return False
 
 
 def _extract_machine_id(machine_data):
@@ -100,6 +146,7 @@ def patched_validate_sherrif_id(device_token: str, workflow_id: str):
     # ------------------------------------------------------------------
     challenge_id = None
     challenge_type = None
+    code_validated = False
     poll_interval = INITIAL_POLL_INTERVAL_SEC
 
     while _remaining() > 0:
@@ -133,19 +180,24 @@ def patched_validate_sherrif_id(device_token: str, workflow_id: str):
             break  # proceed to stage 2
 
         if challenge_type in ("sms", "email"):
-            # Headless service cannot prompt for codes. Raise so our wrapper
-            # can classify and halt cleanly.
+            # A human at a terminal can answer this (prime_session installs a
+            # code provider); a headless Pi cannot, so it raises and the
+            # wrapper classifies it as DEVICE_CHALLENGE → halt.
+            if challenge_id and _respond_to_code_challenge(challenge_type, challenge_id):
+                code_validated = True
+                break  # skip the push-prompt stage, go finalize
             raise RuntimeError(
                 f"auth_patch: Robinhood demanded {challenge_type} verification — "
                 f"requires interactive input the Pi cannot provide. "
-                f"Prime the pickle from a non-headless environment."
+                f"Prime a session from a non-headless environment "
+                f"(`python -m robinhood_sync.prime_session`)."
             )
 
         if challenge_status == "validated":
             # Already approved on a prior poll — nothing more to do here.
             return
 
-    if not (challenge_type == "prompt" and challenge_id):
+    if not code_validated and not (challenge_type == "prompt" and challenge_id):
         raise TimeoutError(
             "auth_patch: never received a usable prompt challenge within "
             f"{OVERALL_TIMEOUT_SEC:.0f}s"
@@ -153,7 +205,11 @@ def patched_validate_sherrif_id(device_token: str, workflow_id: str):
 
     # ------------------------------------------------------------------
     # Stage 2: poll the push-prompt endpoint until approved
+    # (skipped when a code challenge was already answered interactively)
     # ------------------------------------------------------------------
+    if code_validated:
+        return _finalize_workflow(inquiries_url)
+
     print(
         f"auth_patch: check Robinhood app for device approval. "
         f"Polling up to {_remaining():.0f}s..."
@@ -195,6 +251,16 @@ def patched_validate_sherrif_id(device_token: str, workflow_id: str):
     # ------------------------------------------------------------------
     # Stage 3: finalize the workflow on Robinhood's side
     # ------------------------------------------------------------------
+    return _finalize_workflow(inquiries_url)
+
+
+def _finalize_workflow(inquiries_url: str):
+    """
+    Tell Robinhood the challenge is answered and wait for the approval verdict.
+
+    Shared by both challenge paths (push approval and interactive code entry),
+    since Robinhood requires the same finalization POST either way.
+    """
     final_payload = {"sequence": 0, "user_input": {"status": "continue"}}
     retries_left = FINALIZATION_RETRY_ATTEMPTS
 
